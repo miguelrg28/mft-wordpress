@@ -1,0 +1,59 @@
+# Despliega el tema en el VPS (CloudPanel):
+#   rama staging → staging.masflowteam.net
+#   rama main    → www.masflowteam.net (producción)
+# No hay paso de compilación: se revisa la sintaxis PHP y se copia theme/mft.
+#
+# Secrets del repo:
+#   VPS_HOST          IP del VPS
+#   VPS_KNOWN_HOSTS   salida de `ssh-keyscan <IP>`
+#   STAGING_SSH_KEY   llave privada del usuario de staging (pública en CloudPanel → sitio staging → SSH/FTP)
+#   PROD_SSH_KEY      llave privada del usuario del WordPress de producción
+name: Deploy tema
+
+on:
+  push:
+    branches: [main, staging]
+    paths: ['theme/**', '.github/workflows/deploy.yml']
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-theme-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SITE_USER: ${{ github.ref_name == 'main' && 'masflowteam-admin' || 'masflowteam-staging' }}
+      SITE_DIR: ${{ github.ref_name == 'main' && 'htdocs/admin.masflowteam.net' || 'htdocs/staging.masflowteam.net' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Revisar sintaxis PHP
+        run: find theme -name '*.php' -print0 | xargs -0 -n1 php -l > /dev/null
+
+      - name: Llave SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/deploy
+          chmod 600 ~/.ssh/deploy
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+        env:
+          KEY: ${{ github.ref_name == 'main' && secrets.PROD_SSH_KEY || secrets.STAGING_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+
+      # --delete solo dentro de la carpeta del tema: borra archivos que ya no existen en el repo.
+      - name: Copiar el tema
+        run: |
+          rsync -rlz --delete --chmod=D755,F644 -e "ssh -o BatchMode=yes -i ~/.ssh/deploy" \
+            theme/mft/ "$SITE_USER@$VPS_HOST:$SITE_DIR/wp-content/themes/mft/"
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+
+      - name: Vaciar caché
+        run: |
+          ssh -o BatchMode=yes -i ~/.ssh/deploy "$SITE_USER@$VPS_HOST" \
+            "cd $SITE_DIR && wp cache flush --quiet && wp rewrite flush --quiet"
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}

@@ -84,6 +84,17 @@ add_filter('rest_url', function ($url) {
     return (mft_domains_ready() && mft_domains_is_panel_request()) ? str_replace(home_url(), site_url(), $url) : $url;
 });
 
+// Site Kit sigue conectado como https://masflowteam.net (así quedó registrado en
+// Google, con Analytics G-NSGBKPTZCH y Search Console del dominio completo). Sin
+// esto pide reconectar por la nueva dirección con www, y el proxy de Google
+// rechaza la reconexión porque el panel vive en otro subdominio (admin.).
+function mft_domains_sitekit_url(): string
+{
+    return preg_replace('#^(https?://)www\.#i', '$1', untrailingslashit(home_url()));
+}
+add_filter('googlesitekit_canonical_home_url', fn() => mft_domains_sitekit_url());
+add_filter('googlesitekit_site_url', fn() => mft_domains_sitekit_url());
+
 // Desde las páginas públicas, AJAX, formularios y archivos de WordPress salen del
 // mismo dominio público (sin CORS ni cookies entre dominios).
 add_filter('admin_url', function ($url, $path) {

@@ -76,6 +76,14 @@ add_action('login_init', function () {
     }
 }, 0);
 
+// En el panel, la API (/wp-json) se llama por el dominio del panel. WordPress la
+// arma con la dirección pública; desde admin.… eso sería una petición a otro
+// dominio, que el mantenimiento de www bloquea (Site Kit se quedaba en
+// "comprobando compatibilidad", y lo mismo le pasaría al editor y a WooCommerce).
+add_filter('rest_url', function ($url) {
+    return (mft_domains_ready() && mft_domains_is_panel_request()) ? str_replace(home_url(), site_url(), $url) : $url;
+});
+
 // Desde las páginas públicas, AJAX, formularios y archivos de WordPress salen del
 // mismo dominio público (sin CORS ni cookies entre dominios).
 add_filter('admin_url', function ($url, $path) {

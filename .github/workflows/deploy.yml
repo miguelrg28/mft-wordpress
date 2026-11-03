@@ -7,7 +7,7 @@
 #   VPS_HOST          IP del VPS
 #   VPS_KNOWN_HOSTS   salida de `ssh-keyscan <IP>`
 #   STAGING_SSH_KEY   llave privada del usuario de staging (pública en CloudPanel → sitio staging → SSH/FTP)
-#   PROD_SSH_KEY      llave privada del usuario del WordPress de producción
+#   PROD_SSH_KEY      llave privada del usuario SSH de producción (masflowteam-admin, dueño de los archivos del sitio)
 name: Deploy tema
 
 on:
@@ -25,8 +25,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
+      # Usuario SSH de cada sitio (CloudPanel → el sitio → SSH/FTP) y su carpeta.
       SITE_USER: ${{ github.ref_name == 'main' && 'masflowteam-admin' || 'masflowteam-staging' }}
-      SITE_DIR: ${{ github.ref_name == 'main' && 'htdocs/admin.masflowteam.net' || 'htdocs/staging.masflowteam.net' }}
+      SITE_DIR: ${{ github.ref_name == 'main' && '/home/masflowteam-admin/htdocs/admin.masflowteam.net' || '/home/masflowteam-staging/htdocs/staging.masflowteam.net' }}
     steps:
       - uses: actions/checkout@v4
 

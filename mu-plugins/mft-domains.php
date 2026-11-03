@@ -66,6 +66,16 @@ add_action('init', function () {
     }
 }, 0);
 
+// El login del panel es el nativo de WordPress. La Plataforma MFT (plugin
+// masflowteam-platform) manda wp-login.php a su página /ingresar/ del sitio
+// público; en el dominio del panel se desactiva ese desvío para poder entrar
+// aunque el sitio público esté en mantenimiento. En el dominio público no se toca.
+add_action('login_init', function () {
+    if (mft_domains_ready() && mft_domains_is_panel_request() && class_exists('MFTP_Experience')) {
+        remove_action('login_init', ['MFTP_Experience', 'login_gateway']);
+    }
+}, 0);
+
 // Desde las páginas públicas, AJAX, formularios y archivos de WordPress salen del
 // mismo dominio público (sin CORS ni cookies entre dominios).
 add_filter('admin_url', function ($url, $path) {

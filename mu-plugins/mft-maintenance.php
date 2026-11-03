@@ -66,7 +66,7 @@ add_action('template_redirect', function () {
         echo 'En mantenimiento · Under maintenance';
     }
     exit;
-}, -1);
+}, PHP_INT_MIN); // Antes que cualquier plugin que dibuje sus propias páginas (p. ej. la Plataforma MFT).
 
 // --- Interruptor ---------------------------------------------------------------
 add_action('admin_post_mft_maintenance_toggle', function () {

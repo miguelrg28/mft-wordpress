@@ -1,7 +1,8 @@
 # Despliega el tema en el VPS (CloudPanel):
 #   rama staging → staging.masflowteam.net
 #   rama main    → www.masflowteam.net (producción)
-# No hay paso de compilación: se revisa la sintaxis PHP y se copia theme/mft.
+# No hay paso de compilación: se revisa la sintaxis PHP y se copian theme/mft y los
+# mu-plugins (mu-plugins/*.php → wp-content/mu-plugins/, sin borrar los que ya hay).
 #
 # Secrets del repo:
 #   VPS_HOST          IP del VPS
@@ -13,7 +14,7 @@ name: Deploy tema
 on:
   push:
     branches: [main, staging]
-    paths: ['theme/**', '.github/workflows/deploy.yml']
+    paths: ['theme/**', 'mu-plugins/**', '.github/workflows/deploy.yml']
   workflow_dispatch:
 
 concurrency:
@@ -32,7 +33,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Revisar sintaxis PHP
-        run: find theme -name '*.php' -print0 | xargs -0 -n1 php -l > /dev/null
+        run: find theme mu-plugins -name '*.php' -print0 | xargs -0 -n1 php -l > /dev/null
 
       - name: Llave SSH
         run: |
@@ -49,6 +50,13 @@ jobs:
         run: |
           rsync -rlz --delete --chmod=D755,F644 -e "ssh -o BatchMode=yes -i ~/.ssh/deploy" \
             theme/mft/ "$SITE_USER@$VPS_HOST:$SITE_DIR/wp-content/themes/mft/"
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+
+      - name: Copiar los mu-plugins
+        run: |
+          rsync -rlz --chmod=D755,F644 -e "ssh -o BatchMode=yes -i ~/.ssh/deploy" \
+            mu-plugins/ "$SITE_USER@$VPS_HOST:$SITE_DIR/wp-content/mu-plugins/"
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
 

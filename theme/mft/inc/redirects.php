@@ -7,6 +7,27 @@
 
 defined('ABSPATH') || exit;
 
+/**
+ * Con la Plataforma MFT activa (plugin masflowteam-platform del dueño), los
+ * listados del tema que ella también tiene mandan a los de ella. Las fichas
+ * /event/<slug>/ se quedan en el tema: la Plataforma aún no vende eventos de FooEvents.
+ */
+add_action('template_redirect', function () {
+    if (!class_exists('MFTP_Central') || !is_page()) {
+        return;
+    }
+    $to_platform = [
+        'events' => '/eventos/',
+        'mftsports' => '/mft-sports/',
+        'print-center' => '/impresiones/',
+    ];
+    $slug = get_post_field('post_name', get_queried_object_id());
+    if (isset($to_platform[$slug])) {
+        wp_safe_redirect(home_url($to_platform[$slug]), 301);
+        exit;
+    }
+}, 1);
+
 add_action('template_redirect', function () {
     if (!is_404()) {
         return;

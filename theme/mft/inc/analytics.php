@@ -1,11 +1,12 @@
 <?php
 /**
- * Google Analytics 4, AdSense y Meta Pixel: los mismos IDs que tenía el front
- * en Next.js. Para cambiar uno, usa el filtro `mft_analytics_ids` o deja el ID
- * vacío para desactivarlo.
+ * AdSense y Meta Pixel: los mismos IDs que tenía el front en Next.js. Para
+ * cambiar uno, usa el filtro `mft_analytics_ids` o deja el ID vacío para
+ * desactivarlo.
  *
- * Ojo: si Site Kit también inserta la etiqueta de Analytics, se contaría doble.
- * En Site Kit → Configuración → Analytics, desactiva "Colocar la etiqueta".
+ * Google Analytics no va aquí: lo inserta Site Kit (con su Tag Manager) en todo
+ * el sitio, también en las páginas de la Plataforma MFT. Ponerlo además aquí
+ * contaría cada visita dos veces.
  */
 
 defined('ABSPATH') || exit;
@@ -13,7 +14,7 @@ defined('ABSPATH') || exit;
 function mft_analytics_ids(): array
 {
     return apply_filters('mft_analytics_ids', [
-        'ga' => 'G-NSGBKPTZCH',
+        'ga' => '',
         'adsense' => 'ca-pub-1700369962327200',
         'pixel' => '1026465010381352',
     ]);

@@ -64,6 +64,25 @@ foreach ($pages as $slug => [$title, $file]) {
     WP_CLI::log("creada: /{$slug}/ (#{$id})");
 }
 
+// Checkout y carrito clásicos (shortcode), no los de bloques: AZUL, FooEvents y
+// los fees por método de pago solo funcionan con el clásico. WordPress guarda el
+// contenido anterior como revisión, así que se puede restaurar desde el editor.
+foreach (['checkout' => '[woocommerce_checkout]', 'cart' => '[woocommerce_cart]'] as $wc_page => $shortcode) {
+    $page_id = wc_get_page_id($wc_page);
+    $page = $page_id > 0 ? get_post($page_id) : null;
+    if (!$page) {
+        WP_CLI::warning("no hay página de {$wc_page} asignada en WooCommerce → Ajustes → Avanzado");
+        continue;
+    }
+    if (str_contains($page->post_content, $shortcode) && !has_block("woocommerce/{$wc_page}", $page->post_content)) {
+        WP_CLI::log("{$wc_page} ya es clásico: /{$page->post_name}/ (#{$page_id})");
+        continue;
+    }
+    wp_save_post_revision($page_id);
+    wp_update_post(['ID' => $page_id, 'post_content' => "<!-- wp:shortcode -->{$shortcode}<!-- /wp:shortcode -->"]);
+    WP_CLI::log("{$wc_page} pasado a clásico: /{$page->post_name}/ (#{$page_id}, el anterior quedó como revisión)");
+}
+
 // La página "blog" es la de entradas; la portada sigue siendo la que ya esté
 // configurada (el tema usa front-page.php para la portada de todas formas).
 $blog = get_page_by_path('blog');

@@ -2,7 +2,8 @@
 #   rama staging → staging.masflowteam.net
 #   rama main    → www.masflowteam.net (producción)
 # No hay paso de compilación: se revisa la sintaxis PHP y se copian theme/mft y los
-# mu-plugins (mu-plugins/*.php → wp-content/mu-plugins/, sin borrar los que ya hay).
+# mu-plugins (mu-plugins/*.php → wp-content/mu-plugins/, sin borrar los que ya hay) y
+# los archivos de root/ en la raíz del sitio (ads.txt…).
 #
 # Secrets del repo:
 #   VPS_HOST          IP del VPS
@@ -14,7 +15,7 @@ name: Deploy tema
 on:
   push:
     branches: [main, staging]
-    paths: ['theme/**', 'mu-plugins/**', '.github/workflows/deploy.yml']
+    paths: ['theme/**', 'mu-plugins/**', 'root/**', '.github/workflows/deploy.yml']
   workflow_dispatch:
 
 concurrency:
@@ -57,6 +58,14 @@ jobs:
         run: |
           rsync -rlz --chmod=D755,F644 -e "ssh -o BatchMode=yes -i ~/.ssh/deploy" \
             mu-plugins/ "$SITE_USER@$VPS_HOST:$SITE_DIR/wp-content/mu-plugins/"
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+
+      # Archivos sueltos de la raíz pública (ads.txt de AdSense). No borra nada de la raíz.
+      - name: Copiar archivos de la raíz
+        run: |
+          rsync -rlz --chmod=F644 -e "ssh -o BatchMode=yes -i ~/.ssh/deploy" \
+            root/ "$SITE_USER@$VPS_HOST:$SITE_DIR/"
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
 

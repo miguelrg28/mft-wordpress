@@ -1,0 +1,98 @@
+/* Formulario de tarjeta de la página de pago. Hereda colores y tipografía del
+   tema activo (currentColor), así se ve bien en el tema MFT y en la Plataforma. */
+.mft-azul {
+  position: relative;
+  max-width: 28rem;
+  margin: 1.5rem 0;
+  padding: 1.25rem;
+  border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+  border-radius: 12px;
+}
+.mft-azul__field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin-bottom: 1rem;
+}
+.mft-azul__row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+}
+.mft-azul label {
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+.mft-azul input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0.7rem 0.8rem;
+  border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+.mft-azul input[data-field="number"],
+.mft-azul input[data-field="exp"],
+.mft-azul input[data-field="cvc"] {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.04em;
+}
+.mft-azul input.is-invalid {
+  border-color: #e5484d;
+}
+.mft-azul__error,
+.mft-azul__notice {
+  margin: 0 0 1rem;
+  padding: 0.7rem 0.8rem;
+  border-radius: 8px;
+  font-size: 0.875rem;
+}
+.mft-azul__error {
+  color: #e5484d;
+  padding: 0;
+}
+.mft-azul__notice {
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  background: rgba(245, 158, 11, 0.1);
+}
+.mft-azul__pay {
+  width: 100%;
+}
+.mft-azul__brands {
+  margin: 0.9rem 0 0;
+  font-size: 0.75rem;
+  opacity: 0.7;
+}
+.mft-azul [hidden] {
+  display: none !important;
+}
+.mft-azul__overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 99999;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  padding: 1rem;
+  text-align: center;
+  background: rgba(10, 10, 10, 0.88);
+  color: #fff;
+}
+.mft-azul__spinner {
+  width: 3rem;
+  height: 3rem;
+  border: 3px solid rgba(255, 255, 255, 0.25);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: mft-azul-spin 0.8s linear infinite;
+}
+@keyframes mft-azul-spin {
+  to { transform: rotate(360deg); }
+}
+@media (max-width: 480px) {
+  .mft-azul { padding: 1rem; }
+}

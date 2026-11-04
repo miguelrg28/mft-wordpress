@@ -16,6 +16,10 @@ cambios con IA: léelo antes de tocar nada.
     Tienda…), `page.php`, `single.php`, `home.php` (blog), `template-parts/`.
   - `assets/css/mft.css`: todos los estilos. Los colores son variables `--mft-*` al inicio.
   - `assets/js/mft.js`: carrusel y menú móvil, sin librerías.
+- `plugins/mft-azul-api/` se despliega en `wp-content/plugins/mft-azul-api/`: pago con
+  tarjeta vía la API de AZUL con 3D Secure (ver la cabecera del archivo). Las credenciales,
+  el certificado y la llave de AZUL van en `wp-config.php` y en `~/azul/` del servidor,
+  **nunca en el repo**.
 - **No hay paso de compilación.** Se edita el PHP/CSS/JS y listo.
 
 ## Reglas

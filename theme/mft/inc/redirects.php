@@ -9,8 +9,7 @@ defined('ABSPATH') || exit;
 
 /**
  * Con la Plataforma MFT activa (plugin masflowteam-platform del dueño), los
- * listados del tema que ella también tiene mandan a los de ella. Las fichas
- * /event/<slug>/ se quedan en el tema: la Plataforma aún no vende eventos de FooEvents.
+ * listados del tema que ella también tiene mandan a los de ella.
  */
 add_action('template_redirect', function () {
     if (!class_exists('MFTP_Central') || !is_page()) {
@@ -26,6 +25,24 @@ add_action('template_redirect', function () {
         wp_safe_redirect(home_url($to_platform[$slug]), 301);
         exit;
     }
+}, 1);
+
+/**
+ * A pedido del dueño, las fichas de eventos (productos de FooEvents) se ven en la
+ * página de evento de la Plataforma MFT: /event/<slug>/ → /evento/<slug>/.
+ * Temporal (302) para poder volver atrás sin que los navegadores la guarden.
+ * Los demás productos (tienda, complementarios) siguen en la ficha del tema.
+ */
+add_action('template_redirect', function () {
+    if (!class_exists('MFTP_Central') || !function_exists('is_product') || !is_product()) {
+        return;
+    }
+    $id = get_queried_object_id();
+    if (get_post_meta($id, 'WooCommerceEventsEvent', true) !== 'Event') {
+        return;
+    }
+    wp_safe_redirect(home_url('/evento/' . get_post_field('post_name', $id) . '/'), 302);
+    exit;
 }, 1);
 
 add_action('template_redirect', function () {

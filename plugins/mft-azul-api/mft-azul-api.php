@@ -2,8 +2,9 @@
 /**
  * Plugin Name: MFT AZUL API (pago con tarjeta + 3D Secure 2.0)
  * Description: Método de pago de WooCommerce que cobra con tarjeta dentro del sitio usando la "Integración vía API" de AZUL (JSON + autenticación mutua) con 3D Secure 2.0. Convive con la "Página de Pago AZUL": son métodos distintos.
- * Version: 0.3.0
+ * Version: 0.4.0
  * Requires Plugins: woocommerce
+ * WC requires at least: 8.0
  *
  * ---------------------------------------------------------------------------
  * PCI DSS: con este método el número de tarjeta PASA por este servidor, por lo
@@ -30,8 +31,12 @@
  *     `mft_azul_api`, y permítelo en "Payment Gateways per Product".
  *
  * FLUJO
- *  Checkout → la orden queda `pending` y el cliente va a la página de pago de la
- *  orden (order-pay), donde está el formulario de tarjeta (assets/pay.js):
+ *  La tarjeta se escribe en el checkout de WooCommerce (payment_fields). Al
+ *  "Realizar el pedido", WooCommerce crea la orden (`pending`) y process_payment
+ *  devuelve una redirección a `#mft-azul-pay:<orden>:<key>`; assets/pay.js la
+ *  intercepta y cobra sin salir del checkout. Si el script no cargó, la
+ *  redirección es a la página de pago de la orden (order-pay), que tiene el
+ *  mismo formulario. En ambos casos (assets/pay.js):
  *    POST mft/v1/azul-api/pay con tarjeta + BrowserInfo.
  *    - IsoCode 00          → orden pagada, va a "orden recibida".
  *    - IsoCode 3D2METHOD   → se monta el MethodForm (iframe oculto), se consulta
@@ -53,7 +58,16 @@
 defined('ABSPATH') || exit;
 
 define('MFT_AZUL_API_ID', 'mft_azul_api');
-define('MFT_AZUL_API_VERSION', '0.3.0');
+define('MFT_AZUL_API_VERSION', '0.4.0');
+
+// Pedidos en tablas propias (HPOS): solo se usa la API de órdenes de WooCommerce.
+// El checkout por bloques no está soportado: el sitio usa [woocommerce_checkout].
+add_action('before_woocommerce_init', function () {
+    if (class_exists(\Automattic\WooCommerce\Utilities\FeaturesUtil::class)) {
+        \Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility('custom_order_tables', __FILE__, true);
+        \Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility('cart_checkout_blocks', __FILE__, false);
+    }
+});
 
 // Endpoints JSON. El método va en el query string (Default.aspx sin query =
 // ProcessPayment).
@@ -87,7 +101,13 @@ const MFT_AZUL_API_MSG = [
     'auth' => 'No se completó la autenticación con tu banco. Intenta de nuevo.',
     'declined' => 'Pago declinado por el banco emisor. Intenta con otra tarjeta o contacta a tu banco.',
     'card' => 'No pudimos procesar el pago. Verifica los datos de tu tarjeta e intenta de nuevo.',
+    'billing' => 'Revisa tus datos de facturación (nombre, correo, teléfono y dirección) e intenta de nuevo.',
+    'cvc' => 'El código de seguridad (CVC) no es válido.',
+    'number' => 'El número de tarjeta no es válido. Verifícalo e intenta de nuevo.',
 ];
+
+// Una devolución (Refund) solo se acepta dentro de los 6 meses de la venta.
+const MFT_AZUL_API_REFUND_DAYS = 180;
 
 // ===========================================================================
 // GATEWAY
@@ -104,8 +124,8 @@ add_action('plugins_loaded', function () {
         {
             $this->id = MFT_AZUL_API_ID;
             $this->method_title = 'Tarjeta de crédito/débito (AZUL API)';
-            $this->method_description = 'Pago con tarjeta dentro del sitio (Integración vía API de AZUL + 3D Secure 2.0). El cliente escribe la tarjeta en la página de pago de la orden.';
-            $this->has_fields = false; // la tarjeta se pide en la página de pago de la orden
+            $this->method_description = 'Pago con tarjeta dentro del sitio (Integración vía API de AZUL + 3D Secure 2.0). El cliente escribe la tarjeta en el checkout y el cobro se hace sin salir del sitio.';
+            $this->has_fields = true;
             $this->supports = ['products', 'refunds'];
 
             $this->init_form_fields();
@@ -120,6 +140,66 @@ add_action('plugins_loaded', function () {
 
             add_action('woocommerce_update_options_payment_gateways_' . $this->id, [$this, 'process_admin_options']);
             add_action('woocommerce_receipt_' . $this->id, [$this, 'receipt_page']);
+            add_action('wp_enqueue_scripts', [$this, 'enqueue_assets']);
+        }
+
+        /** Logos de las marcas aceptadas (los SVG vienen con WooCommerce). */
+        public function get_icon()
+        {
+            $base = WC()->plugin_url() . '/assets/images/icons/credit-cards/';
+            $html = '';
+            foreach (['visa' => 'Visa', 'mastercard' => 'Mastercard', 'amex' => 'American Express'] as $file => $alt) {
+                $html .= '<img class="mft-azul__brand" src="' . esc_url($base . $file . '.svg') . '" alt="' . esc_attr($alt) . '" width="38" height="24">';
+            }
+            return apply_filters('woocommerce_gateway_icon', '<span class="mft-azul__brands-icons">' . $html . '</span>', $this->id);
+        }
+
+        /** Checkout y página de pago de la orden. */
+        public function enqueue_assets()
+        {
+            if ($this->enabled !== 'yes' || !function_exists('is_checkout') || !is_checkout() || is_order_received_page()) {
+                return;
+            }
+            wp_enqueue_style('mft-azul-api', plugins_url('assets/pay.css', __FILE__), [], MFT_AZUL_API_VERSION);
+            wp_enqueue_script('mft-azul-api', plugins_url('assets/pay.js', __FILE__), ['jquery'], MFT_AZUL_API_VERSION, true);
+            wp_localize_script('mft-azul-api', 'mftAzul', [
+                'api' => untrailingslashit(rest_url('mft/v1/azul-api')),
+                'gatewayId' => $this->id,
+                'msg' => [
+                    'generic' => MFT_AZUL_API_MSG['generic'],
+                    'connect' => 'No pudimos comunicarnos con el sitio. Revisa tu conexión a internet e intenta de nuevo.',
+                    'checking' => 'Estamos confirmando el resultado de tu pago...',
+                    'unknown' => MFT_AZUL_API_MSG['unknown'],
+                    'method' => 'No se pudo completar la verificación con tu banco. Intenta de nuevo.',
+                    'leave' => 'Tu pago se está procesando. Si sales ahora podrías no ver el resultado.',
+                ],
+            ]);
+        }
+
+        /**
+         * Campos de tarjeta dentro del checkout. En "Pagar orden" (pay_for_order,
+         * desde Mi cuenta o el correo) la tarjeta se pide en el paso siguiente.
+         */
+        public function payment_fields()
+        {
+            if ($this->description) {
+                echo wpautop(wp_kses_post($this->description));
+            }
+            if (is_checkout_pay_page()) {
+                echo '<p>Escribirás los datos de tu tarjeta en el siguiente paso.</p>';
+                return;
+            }
+            mft_azul_api_card_form('checkout');
+        }
+
+        /** Rechaza pagos sin HTTPS en producción antes de crear la orden. */
+        public function validate_fields()
+        {
+            if (!$this->is_test() && !mft_azul_api_is_https()) {
+                wc_add_notice('La conexión no es segura. Abre el checkout con https://.', 'error');
+                return false;
+            }
+            return true;
         }
 
         public function init_form_fields()
@@ -151,7 +231,7 @@ add_action('plugins_loaded', function () {
                 'description' => [
                     'title' => 'Descripción',
                     'type' => 'textarea',
-                    'default' => 'Paga con Visa, Mastercard o American Express de forma segura (3D Secure). Escribirás los datos de tu tarjeta en el siguiente paso.',
+                    'default' => 'Paga con Visa, Mastercard o American Express de forma segura (3D Secure).',
                 ],
                 'environment' => [
                     'title' => 'Ambiente',
@@ -294,8 +374,8 @@ add_action('plugins_loaded', function () {
         }
 
         /**
-         * Al colocar la orden no se cobra todavía: queda `pending` y el cliente
-         * pasa a la página de pago de la orden, donde escribe la tarjeta.
+         * Al colocar la orden no se cobra todavía (la tarjeta no viaja con el
+         * checkout): queda `pending` y assets/pay.js la cobra con /pay.
          * WooCommerce solo llega aquí si el método está disponible para este
          * usuario, así que la marca `_mft_azul_allowed` autoriza a pagar la orden
          * con /pay (ver mft_azul_api_order_from_request).
@@ -312,13 +392,19 @@ add_action('plugins_loaded', function () {
             if (!$order->has_status('pending')) {
                 $order->update_status('pending');
             }
+            // pay.js marca `mft_azul_inline` cuando está listo para cobrar en el
+            // checkout. Si no (script bloqueado, plantilla distinta), se usa la
+            // página de pago de la orden, que tiene el mismo formulario.
+            $inline = wp_doing_ajax() && isset($_POST['mft_azul_inline']) && $_POST['mft_azul_inline'] === '1'; // phpcs:ignore WordPress.Security.NonceVerification
+            $pay_url = $order->get_checkout_payment_url(true);
             return [
                 'result' => 'success',
-                'redirect' => $order->get_checkout_payment_url(true),
+                'redirect' => $inline ? '#mft-azul-pay:' . $order->get_id() . ':' . $order->get_order_key() : $pay_url,
+                'mftAzulPayUrl' => $pay_url,
             ];
         }
 
-        /** Página de pago de la orden: formulario de tarjeta. */
+        /** Página de pago de la orden: formulario de tarjeta con su propio botón. */
         public function receipt_page($order_id)
         {
             $order = wc_get_order($order_id);
@@ -334,58 +420,7 @@ add_action('plugins_loaded', function () {
                 $order->delete_meta_data('_mft_azul_notice');
                 $order->save();
             }
-
-            wp_enqueue_style('mft-azul-api', plugins_url('assets/pay.css', __FILE__), [], MFT_AZUL_API_VERSION);
-            wp_enqueue_script('mft-azul-api', plugins_url('assets/pay.js', __FILE__), [], MFT_AZUL_API_VERSION, true);
-            wp_localize_script('mft-azul-api', 'mftAzul', [
-                'api' => untrailingslashit(rest_url('mft/v1/azul-api')),
-                'orderId' => $order->get_id(),
-                'orderKey' => $order->get_order_key(),
-                'msg' => [
-                    'generic' => MFT_AZUL_API_MSG['generic'],
-                    'connect' => 'No pudimos comunicarnos con el sitio. Revisa tu conexión a internet e intenta de nuevo.',
-                    'checking' => 'Estamos confirmando el resultado de tu pago...',
-                    'unknown' => MFT_AZUL_API_MSG['unknown'],
-                    'method' => 'No se pudo completar la verificación con tu banco. Intenta de nuevo.',
-                    'leave' => 'Tu pago se está procesando. Si sales ahora podrías no ver el resultado.',
-                ],
-            ]);
-            ?>
-            <div class="mft-azul" id="mft-azul" data-busy="0">
-                <p class="mft-azul__notice" role="alert"<?php echo $notice === '' ? ' hidden' : ''; ?>><?php echo esc_html($notice); ?></p>
-                <noscript><p class="mft-azul__notice">Para pagar con tarjeta necesitas activar JavaScript en tu navegador.</p></noscript>
-                <?php // Sin <form> ni atributos name: la tarjeta nunca viaja por un submit nativo. ?>
-                <div class="mft-azul__field">
-                    <label for="mft-cc-name">Nombre en la tarjeta</label>
-                    <input id="mft-cc-name" type="text" autocomplete="cc-name" maxlength="60" data-field="name">
-                </div>
-                <div class="mft-azul__field">
-                    <label for="mft-cc-number">Número de tarjeta</label>
-                    <input id="mft-cc-number" type="text" inputmode="numeric" autocomplete="cc-number" maxlength="23" placeholder="0000 0000 0000 0000" data-field="number">
-                </div>
-                <div class="mft-azul__row">
-                    <div class="mft-azul__field">
-                        <label for="mft-cc-exp">Vencimiento</label>
-                        <input id="mft-cc-exp" type="text" inputmode="numeric" autocomplete="cc-exp" maxlength="7" placeholder="MM/AA" data-field="exp">
-                    </div>
-                    <div class="mft-azul__field">
-                        <label for="mft-cc-csc">CVC</label>
-                        <input id="mft-cc-csc" type="text" inputmode="numeric" autocomplete="cc-csc" maxlength="4" placeholder="123" data-field="cvc">
-                    </div>
-                </div>
-                <p class="mft-azul__error" role="alert" hidden></p>
-                <button type="button" class="button alt mft-azul__pay">
-                    Pagar <?php echo wp_kses_post($order->get_formatted_order_total()); ?>
-                </button>
-                <?php // AZUL exige mostrar las marcas de 3D Secure en el checkout. ?>
-                <p class="mft-azul__brands">Pago procesado por AZUL · Visa Secure · Mastercard ID Check · Amex SafeKey</p>
-                <div class="mft-azul__overlay" hidden>
-                    <span class="mft-azul__spinner" aria-hidden="true"></span>
-                    <strong class="mft-azul__stage">Procesando tu pago...</strong>
-                    <span>No cierres ni recargues esta ventana.</span>
-                </div>
-            </div>
-            <?php
+            mft_azul_api_card_form('receipt', $order, $notice);
         }
 
         /**
@@ -435,6 +470,13 @@ add_action('plugins_loaded', function () {
                     }
                 }
                 if (!$can_void) {
+                    $sold_at = $approved_at ?: (int) strtotime((string) $order->get_meta('_mft_azul_datetime'));
+                    if ($sold_at > 0 && time() - $sold_at > MFT_AZUL_API_REFUND_DAYS * DAY_IN_SECONDS) {
+                        return new WP_Error('mft_azul', sprintf(
+                            'AZUL solo acepta devoluciones dentro de los 6 meses de la venta (esta fue el %s). Haz la devolución por otro medio.',
+                            wp_date('d/m/Y', $sold_at)
+                        ));
+                    }
                     $label = 'Devolución (Refund)';
                     $cents = mft_azul_api_cents($amount);
                     $total_cents = mft_azul_api_cents($order->get_total());
@@ -445,6 +487,7 @@ add_action('plugins_loaded', function () {
                     $order->update_meta_data('_mft_azul_refund_count', $refunds);
                     $order->save();
                     $ref = mft_azul_api_attempt_ref($order, 'R' . $refunds);
+                    $order_number = mft_azul_api_order_number($ref);
 
                     $res = mft_azul_api_call('ProcessPayment', [
                         'Channel' => $this->get_option('channel'),
@@ -460,9 +503,9 @@ add_action('plugins_loaded', function () {
                         'AcquirerRefData' => '',
                         'RRN' => null,
                         'AzulOrderId' => $azul_order_id,
-                        'CustomerServicePhone' => $this->get_option('customer_service_phone'),
-                        'OrderNumber' => $ref,
-                        'ECommerceUrl' => $this->get_option('ecommerce_url'),
+                        'CustomerServicePhone' => mb_substr((string) $this->get_option('customer_service_phone'), 0, 32),
+                        'OrderNumber' => $order_number,
+                        'ECommerceUrl' => mb_substr((string) $this->get_option('ecommerce_url'), 0, 32),
                         'CustomOrderId' => $ref,
                         'DataVaultToken' => '',
                         'ForceNo3DS' => '1',
@@ -504,6 +547,82 @@ add_action('plugins_loaded', function () {
         $gateways[] = 'MFT_Azul_API_Gateway';
         return $gateways;
     });
+});
+
+/**
+ * Formulario de tarjeta. Sin atributos name: la tarjeta nunca viaja con el
+ * checkout ni con un submit nativo; pay.js la manda solo a /pay. Los id sí son
+ * necesarios: WooCommerce los usa para conservar lo escrito cuando recarga el
+ * bloque de pagos (update_checkout).
+ *
+ * @param string        $context 'checkout' (usa el botón del checkout) o 'receipt'.
+ * @param WC_Order|null $order   Solo en 'receipt'.
+ */
+function mft_azul_api_card_form($context, $order = null, $notice = '')
+{
+    $receipt = $context === 'receipt' && $order;
+    ?>
+    <div class="mft-azul mft-azul--<?php echo esc_attr($context); ?>" data-context="<?php echo esc_attr($context); ?>"
+        <?php if ($receipt) : ?>data-order-id="<?php echo esc_attr($order->get_id()); ?>" data-order-key="<?php echo esc_attr($order->get_order_key()); ?>"<?php endif; ?>>
+        <p class="mft-azul__notice" role="alert"<?php echo $notice === '' ? ' hidden' : ''; ?>><?php echo esc_html($notice); ?></p>
+        <noscript><p class="mft-azul__notice">Para pagar con tarjeta necesitas activar JavaScript en tu navegador.</p></noscript>
+        <?php if (!$receipt) : ?>
+            <input type="hidden" id="mft-azul-inline" name="mft_azul_inline" value="">
+        <?php endif; ?>
+        <div class="mft-azul__field">
+            <label for="mft-cc-name">Nombre en la tarjeta <abbr class="required" title="obligatorio">*</abbr></label>
+            <input id="mft-cc-name" class="input-text" type="text" autocomplete="cc-name" maxlength="60" data-field="name">
+        </div>
+        <div class="mft-azul__field">
+            <label for="mft-cc-number">Número de tarjeta <abbr class="required" title="obligatorio">*</abbr></label>
+            <input id="mft-cc-number" class="input-text" type="text" inputmode="numeric" autocomplete="cc-number" maxlength="23" placeholder="0000 0000 0000 0000" data-field="number">
+        </div>
+        <div class="mft-azul__row">
+            <div class="mft-azul__field">
+                <label for="mft-cc-exp">Vencimiento <abbr class="required" title="obligatorio">*</abbr></label>
+                <input id="mft-cc-exp" class="input-text" type="text" inputmode="numeric" autocomplete="cc-exp" maxlength="7" placeholder="MM/AA" data-field="exp">
+            </div>
+            <div class="mft-azul__field">
+                <label for="mft-cc-csc">CVC <abbr class="required" title="obligatorio">*</abbr></label>
+                <input id="mft-cc-csc" class="input-text" type="text" inputmode="numeric" autocomplete="cc-csc" maxlength="4" placeholder="123" data-field="cvc">
+            </div>
+        </div>
+        <p class="mft-azul__error" role="alert" hidden></p>
+        <?php if ($receipt) : ?>
+            <button type="button" class="button alt mft-azul__pay">
+                Pagar <?php echo wp_kses_post($order->get_formatted_order_total()); ?>
+            </button>
+        <?php endif; ?>
+        <?php // AZUL exige mostrar las marcas de 3D Secure en el checkout. ?>
+        <p class="mft-azul__brands">Pago seguro procesado por AZUL · Visa Secure · Mastercard ID Check · American Express SafeKey</p>
+    </div>
+    <?php
+}
+
+/** Datos del cobro AZUL en la orden (admin), debajo de los datos de facturación. */
+add_action('woocommerce_admin_order_data_after_billing_address', function ($order) {
+    if (!$order instanceof WC_Order || $order->get_payment_method() !== MFT_AZUL_API_ID) {
+        return;
+    }
+    $rows = [
+        'Tarjeta' => $order->get_meta('_mft_azul_card_last4') ? '****' . $order->get_meta('_mft_azul_card_last4') : '',
+        'Autorización' => $order->get_meta('_mft_azul_authorization_code'),
+        'AzulOrderId' => $order->get_meta('_mft_azul_order_id'),
+        'RRN' => $order->get_meta('_mft_azul_rrn'),
+        'Intentos' => $order->get_meta('_mft_azul_attempts'),
+        'Pendiente de verificar' => $order->get_meta('_mft_azul_pending_verify'),
+        'Anulada' => $order->get_meta('_mft_azul_voided') ? 'Sí' : '',
+    ];
+    echo '<div class="mft-azul-admin"><h3>AZUL API</h3>';
+    if ($order->get_meta('_mft_azul_test') || $order->get_meta('_mft_azul_allowed') === 'test') {
+        echo '<p><strong style="color:#b32d2e">PAGO DE PRUEBA: no se cobró dinero.</strong></p>';
+    }
+    foreach ($rows as $label => $value) {
+        if ((string) $value !== '') {
+            echo '<p><strong>' . esc_html($label) . ':</strong> ' . esc_html((string) $value) . '</p>';
+        }
+    }
+    echo '</div>';
 });
 
 // ===========================================================================
@@ -823,20 +942,79 @@ function mft_azul_api_retry_redirect($order, $message)
     return $order->get_checkout_payment_url(true);
 }
 
+/**
+ * Campo de un VALIDATION_ERROR de AZUL ("VALIDATION_ERROR:Amount" → "amount"),
+ * o '' si no es uno.
+ */
+function mft_azul_api_validation_field(array $res)
+{
+    return preg_match('/VALIDATION_ERROR\s*:\s*([A-Za-z.]+)/', (string) ($res['ErrorDescription'] ?? ''), $m)
+        ? strtolower($m[1])
+        : '';
+}
+
+/**
+ * ¿AZUL rechazó por nuestra configuración y no por la tarjeta? Credenciales,
+ * comercio o un campo que arma el plugin (monto, ITBIS, canal…). El cliente no
+ * puede arreglarlo: se le dice que el método no está disponible y se alerta al
+ * equipo (ver mft_azul_api_handle_result).
+ */
+function mft_azul_api_is_config_error(array $res)
+{
+    $desc = strtoupper((string) ($res['ErrorDescription'] ?? ''));
+    $message = strtoupper((string) ($res['ResponseMessage'] ?? ''));
+    if (preg_match('/INVALID_AUTH|MISSING_AUTH|INVALID_MERCHANT|INVALID_STORE|INVALID_CHANNEL/', $desc)
+        || str_contains($message, 'PROVEEDOR INVALIDO')) {
+        return true;
+    }
+    $field = mft_azul_api_validation_field($res);
+    return $field !== '' && !in_array($field, mft_azul_api_customer_fields(), true)
+        && !preg_match('/^(cardnumber|expiration|cvc|cardholderinfo)/', $field);
+}
+
+/** Campos de VALIDATION_ERROR que vienen de los datos de facturación del cliente. */
+function mft_azul_api_customer_fields()
+{
+    return ['email', 'name', 'phonehome', 'phonemobile', 'phonework'];
+}
+
 /** Mensaje para el cliente (los detalles técnicos van solo a la nota privada). */
 function mft_azul_api_customer_message(array $res)
 {
     $iso = (string) ($res['IsoCode'] ?? '');
+    $desc = strtoupper((string) ($res['ErrorDescription'] ?? ''));
+    $text = $desc . ' ' . strtoupper((string) ($res['ResponseMessage'] ?? ''));
+
+    if (mft_azul_api_is_config_error($res)) {
+        return MFT_AZUL_API_MSG['unavailable'];
+    }
+    if (str_contains($desc, 'SGS-005003')) {
+        return 'El procesador de pagos no pudo registrar el intento. Espera unos segundos e intenta de nuevo; no se te cobró nada.';
+    }
+    $field = mft_azul_api_validation_field($res);
+    if ($field !== '') {
+        if ($field === 'cvc') {
+            return MFT_AZUL_API_MSG['cvc'];
+        }
+        if ($field === 'cardnumber') {
+            return MFT_AZUL_API_MSG['number'];
+        }
+        return str_starts_with($field, 'expiration') ? 'La fecha de vencimiento no es válida.' : MFT_AZUL_API_MSG['billing'];
+    }
     if (($res['ResponseCode'] ?? '') === 'Error') {
         return MFT_AZUL_API_MSG['card'];
     }
-    if (str_contains((string) ($res['ErrorDescription'] ?? ''), 'SGS-005003')) {
-        return 'El procesador de pagos no pudo registrar el intento. Espera unos segundos e intenta de nuevo; no se te cobró nada.';
-    }
     if ($iso === '99') {
-        return stripos((string) ($res['ErrorDescription'] ?? ''), '3D') !== false
-            ? 'Tu banco no pudo autenticar la tarjeta (3D Secure). Intenta de nuevo o usa otra tarjeta.'
-            : MFT_AZUL_API_MSG['card'];
+        if (str_contains($text, '3D')) {
+            return 'Tu banco no pudo autenticar la tarjeta (3D Secure). Intenta de nuevo o usa otra tarjeta.';
+        }
+        if (preg_match('/CVC|CVV/', $text)) {
+            return MFT_AZUL_API_MSG['cvc'];
+        }
+        if (str_contains($text, 'SGS-002303') || str_contains($text, 'TARJETA INVALIDA') || str_contains($text, 'TARJETAINVALIDA')) {
+            return MFT_AZUL_API_MSG['number'];
+        }
+        return MFT_AZUL_API_MSG['card'];
     }
     if ($iso === '08') {
         return 'Tu banco no pudo autenticar la tarjeta en este momento. Intenta más tarde o usa otra tarjeta.';
@@ -845,13 +1023,14 @@ function mft_azul_api_customer_message(array $res)
         '51' => 'Fondos insuficientes. Intenta con otra tarjeta.',
         '54' => 'La tarjeta está vencida. Intenta con otra tarjeta.',
         '05' => MFT_AZUL_API_MSG['declined'],
-        '14' => 'El número de tarjeta no es válido. Verifícalo e intenta de nuevo.',
+        '14' => MFT_AZUL_API_MSG['number'],
         '41' => MFT_AZUL_API_MSG['declined'],
         '43' => MFT_AZUL_API_MSG['declined'],
         '57' => 'Tu tarjeta no permite este tipo de compra. Contacta a tu banco o usa otra tarjeta.',
         '61' => 'La compra supera el límite de tu tarjeta. Intenta con otra tarjeta.',
-        '82' => 'El código de seguridad (CVC) no es válido.',
-        'N7' => 'El código de seguridad (CVC) no es válido.',
+        '63' => MFT_AZUL_API_MSG['declined'],
+        '82' => MFT_AZUL_API_MSG['cvc'],
+        'N7' => MFT_AZUL_API_MSG['cvc'],
         '91' => 'Tu banco no responde en este momento. Intenta más tarde.',
     ];
     return $known[$iso] ?? MFT_AZUL_API_MSG['declined'];
@@ -927,8 +1106,16 @@ function mft_azul_api_handle_result($order, $res)
     // Declinada o error de validación. La orden sigue `pending` para reintentar.
     $order->update_meta_data('_mft_azul_3ds_state', 'declined');
     $order->save();
-    $order->add_order_note('AZUL API declinado. ' . mft_azul_api_detail($res));
-    mft_azul_api_count_decline();
+    if (mft_azul_api_is_config_error($res)) {
+        // No es la tarjeta del cliente: no cuenta para el freno de card testing.
+        $order->add_order_note('ERROR DE CONFIGURACIÓN AZUL (credenciales, comercio o datos que envía el plugin): ' . mft_azul_api_detail($res) . '. Revisa los ajustes del método.');
+        if (function_exists('wc_get_logger')) {
+            wc_get_logger()->error('Error de configuración AZUL en la orden ' . $order->get_id() . ': ' . mft_azul_api_detail($res), ['source' => 'mft-azul-api']);
+        }
+    } else {
+        $order->add_order_note('AZUL API declinado. ' . mft_azul_api_detail($res));
+        mft_azul_api_count_decline();
+    }
     return [
         'status' => 'declined',
         'isoCode' => $iso,
@@ -954,6 +1141,25 @@ function mft_azul_api_attempt_ref($order, $attempt)
         $ref = $prefix . '-' . $ref;
     }
     return $ref;
+}
+
+/**
+ * OrderNumber admite 15 caracteres (CustomOrderId, 75). Se quita el guion del
+ * prefijo de pruebas (siempre mide 6, así que no se confunde con el número de
+ * orden) y, si aun así no cabe, se usa un hash del intento: sigue siendo único,
+ * y AZUL rechaza un OrderNumber repetido.
+ */
+function mft_azul_api_order_number($ref)
+{
+    $compact = preg_replace('/^(T[0-9A-F]{5})-/', '$1', $ref);
+    return strlen($compact) <= 15 ? $compact : strtoupper(substr(hash('sha256', $ref), 0, 15));
+}
+
+/** Quita los caracteres que AZUL no acepta en textos libres (" \ '). */
+function mft_azul_api_clean_text($value, $max)
+{
+    $value = preg_replace('/\s+/u', ' ', str_replace(['"', '\\', "'"], '', (string) $value));
+    return mb_substr(trim((string) $value), 0, $max);
 }
 
 function mft_azul_api_sid($order)
@@ -1106,31 +1312,51 @@ function mft_azul_api_luhn($number)
     return $sum % 10 === 0;
 }
 
-/** Recorta/omite campos vacíos de CardHolderInfo (AZUL recomienda omitirlos). */
+/**
+ * CardHolderInfo. El manual de la API (v1.2) marca como obligatorios nombre,
+ * correo, teléfono (PhoneHome) y las direcciones de facturación y de envío; el
+ * de 3D Secure pide omitir los vacíos. Sin dirección de envío (boletos) se manda
+ * la de facturación, y los vacíos se omiten.
+ */
 function mft_azul_api_cardholder_info($order, $name)
 {
-    $country = $order->get_billing_country();
-    $state = $order->get_billing_state();
-    $states = $country ? (array) WC()->countries->get_states($country) : [];
+    $state_name = function ($country, $state) {
+        $states = $country ? (array) WC()->countries->get_states($country) : [];
+        return $states[$state] ?? $state;
+    };
+    $phone = $order->get_billing_phone();
+    $ship = $order->has_shipping_address();
+    $ship_country = $ship ? $order->get_shipping_country() : $order->get_billing_country();
     $fields = [
         'Name' => $name,
         'Email' => $order->get_billing_email(),
-        'PhoneMobile' => $order->get_billing_phone(),
+        'PhoneHome' => $phone,
+        'PhoneMobile' => $phone,
         'BillingAddressLine1' => $order->get_billing_address_1(),
         'BillingAddressLine2' => $order->get_billing_address_2(),
         'BillingAddressCity' => $order->get_billing_city(),
-        'BillingAddressState' => $states[$state] ?? $state,
-        'BillingAddressCountry' => $country,
+        'BillingAddressState' => $state_name($order->get_billing_country(), $order->get_billing_state()),
+        'BillingAddressCountry' => $order->get_billing_country(),
         'BillingAddressZip' => $order->get_billing_postcode(),
+        'ShippingAddressLine1' => $ship ? $order->get_shipping_address_1() : $order->get_billing_address_1(),
+        'ShippingAddressLine2' => $ship ? $order->get_shipping_address_2() : $order->get_billing_address_2(),
+        'ShippingAddressCity' => $ship ? $order->get_shipping_city() : $order->get_billing_city(),
+        'ShippingAddressState' => $state_name($ship_country, $ship ? $order->get_shipping_state() : $order->get_billing_state()),
+        'ShippingAddressCountry' => $ship_country,
+        'ShippingAddressZip' => $ship ? $order->get_shipping_postcode() : $order->get_billing_postcode(),
     ];
-    $limits = ['Email' => 254, 'PhoneMobile' => 32, 'BillingAddressZip' => 24, 'BillingAddressCountry' => 2];
+    $limits = [
+        'Email' => 254, 'PhoneHome' => 32, 'PhoneMobile' => 32,
+        'BillingAddressZip' => 24, 'ShippingAddressZip' => 24,
+        'BillingAddressCountry' => 2, 'ShippingAddressCountry' => 2,
+    ];
     $out = [];
     foreach ($fields as $k => $v) {
-        $v = trim(wp_strip_all_tags((string) $v));
+        $v = mft_azul_api_clean_text(wp_strip_all_tags((string) $v), $limits[$k] ?? 96);
         if ($v === '') {
             continue;
         }
-        $out[$k] = mb_substr($v, 0, $limits[$k] ?? 96);
+        $out[$k] = $v;
     }
     return $out;
 }
@@ -1338,7 +1564,7 @@ function mft_azul_api_rest_pay(WP_REST_Request $request)
         return new WP_Error('mft_azul_rate', MFT_AZUL_API_MSG['rate'], ['status' => 429]);
     }
     $max = max(1, (int) $gw->get_option('max_attempts', 5));
-    if ((int) $order->get_meta('_mft_azul_attempts') >= $max) {
+    if (mft_azul_api_customer_attempts($order) >= $max) {
         return new WP_Error('mft_azul_attempts', MFT_AZUL_API_MSG['attempts'], ['status' => 429]);
     }
     if (!mft_azul_api_lock($order->get_id())) {
@@ -1356,20 +1582,28 @@ function mft_azul_api_rest_pay(WP_REST_Request $request)
             return ['status' => 'pending', 'message' => MFT_AZUL_API_MSG['verifying']];
         }
         $attempts = (int) $order->get_meta('_mft_azul_attempts');
-        if ($attempts >= $max) {
+        if (mft_azul_api_customer_attempts($order) >= $max) {
             return new WP_Error('mft_azul_attempts', MFT_AZUL_API_MSG['attempts'], ['status' => 429]);
         }
 
-        // AZUL a veces responde "SGS-005003: The order already exists" con un
-        // número nuevo (visto en pruebas). Es un rechazo sin cobro: se reintenta
-        // una vez con otro número de intento.
-        for ($try = 0; $try < 2; $try++) {
+        // El sandbox de AZUL responde en ráfagas "SGS-005003: The order already
+        // exists" aunque OrderNumber, CustomOrderId y TermUrl sean nuevos (en
+        // ~1.6 s, sin procesar la venta). Es un rechazo sin cobro: se reintenta
+        // hasta 2 veces con otro número tras una pausa, y esos reintentos no
+        // cuentan como intentos del cliente.
+        $sgs = (int) $order->get_meta('_mft_azul_sgs_retries');
+        for ($try = 0; $try < 3; $try++) {
+            if ($try > 0) {
+                sleep(1 + $try);
+            }
             $res = mft_azul_api_sale($gw, $order, ++$attempts, $request, $number, $cvc, $month, $year, $name);
             $repeated = !is_wp_error($res) && ($res['IsoCode'] ?? '') === '99'
                 && str_contains((string) ($res['ErrorDescription'] ?? ''), 'SGS-005003');
-            if (!$repeated || $attempts >= $max) {
+            if (!$repeated || $try === 2) {
                 break;
             }
+            $order->update_meta_data('_mft_azul_sgs_retries', ++$sgs);
+            $order->save();
             mft_azul_api_log('Sale SGS-005003, reintento con otro número', ['attempt' => $attempts]);
         }
         unset($number, $cvc, $card);
@@ -1378,6 +1612,12 @@ function mft_azul_api_rest_pay(WP_REST_Request $request)
     } finally {
         mft_azul_api_unlock($order->get_id());
     }
+}
+
+/** Intentos que hizo el cliente (sin los reintentos automáticos por SGS-005003). */
+function mft_azul_api_customer_attempts($order)
+{
+    return max(0, (int) $order->get_meta('_mft_azul_attempts') - (int) $order->get_meta('_mft_azul_sgs_retries'));
 }
 
 /** Envía la venta (Sale con 3D Secure) de un intento. */
@@ -1409,11 +1649,11 @@ function mft_azul_api_sale($gw, $order, $attempts, WP_REST_Request $request, $nu
         'Payments' => '1',
         'Plan' => '0',
         'AcquirerRefData' => '1',
-        'CustomerServicePhone' => $gw->get_option('customer_service_phone'),
-        'OrderNumber' => $custom_order_id,
-        'ECommerceUrl' => $gw->get_option('ecommerce_url'),
+        'CustomerServicePhone' => mb_substr((string) $gw->get_option('customer_service_phone'), 0, 32),
+        'OrderNumber' => mft_azul_api_order_number($custom_order_id),
+        'ECommerceUrl' => mb_substr((string) $gw->get_option('ecommerce_url'), 0, 32),
         'CustomOrderId' => $custom_order_id,
-        'AltMerchantName' => mb_substr((string) $gw->get_option('alt_merchant_name'), 0, 25),
+        'AltMerchantName' => mft_azul_api_clean_text($gw->get_option('alt_merchant_name'), 25),
         'DataVaultToken' => '',
         'SaveToDataVault' => '0',
         'ForceNo3DS' => '0',

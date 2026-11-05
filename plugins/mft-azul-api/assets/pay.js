@@ -1,5 +1,10 @@
 /**
- * Página de pago de la orden con AZUL API + 3D Secure 2.0.
+ * Pago con tarjeta AZUL API + 3D Secure 2.0, en dos lugares:
+ *  - Checkout de WooCommerce (`data-context="checkout"`): los campos están en el
+ *    bloque de pagos y se usa el botón "Realizar el pedido". WooCommerce crea la
+ *    orden y redirige a `#mft-azul-pay:<orden>:<key>`; aquí se intercepta ese
+ *    hash y se cobra sin salir de la página.
+ *  - Página de pago de la orden (`data-context="receipt"`): botón propio.
  *
  * 1. Envía la tarjeta y los datos del navegador a mft/v1/azul-api/pay.
  * 2. Si AZUL pide 3D2METHOD, monta el MethodForm del emisor en un iframe oculto y
@@ -15,49 +20,73 @@
   'use strict';
 
   var cfg = window.mftAzul;
-  var root = document.getElementById('mft-azul');
-  if (!cfg || !root) return;
+  if (!cfg) return;
   var msg = cfg.msg || {};
+  var $ = window.jQuery;
+  var HASH = /^#mft-azul-pay:(\d+):([A-Za-z0-9_\-]+)$/;
 
-  var inputs = {};
-  root.querySelectorAll('[data-field]').forEach(function (el) {
-    inputs[el.getAttribute('data-field')] = el;
-  });
-  var errorEl = root.querySelector('.mft-azul__error');
-  var noticeEl = root.querySelector('.mft-azul__notice');
-  var overlay = root.querySelector('.mft-azul__overlay');
-  var stageEl = root.querySelector('.mft-azul__stage');
-  var payBtn = root.querySelector('.mft-azul__pay');
   var busy = false;
   var leaving = false;
+  var order = null; // { id, key } de la orden que se está cobrando
+  var overlay = null;
+
+  // En el checkout WooCommerce vuelve a pintar el bloque de pagos (update_checkout):
+  // los elementos se buscan cada vez, nunca se guardan.
+  function root() {
+    return document.querySelector('.mft-azul');
+  }
+  function part(sel) {
+    var r = root();
+    return r ? r.querySelector(sel) : null;
+  }
+  function input(name) {
+    return part('[data-field="' + name + '"]');
+  }
+  function value(name) {
+    var el = input(name);
+    return el ? el.value : '';
+  }
+  function isCheckout() {
+    var r = root();
+    return !!r && r.getAttribute('data-context') === 'checkout';
+  }
+  var FIELDS = ['name', 'number', 'exp', 'cvc'];
 
   function digits(v) {
     return String(v || '').replace(/\D/g, '');
   }
 
-  // Agrupa de 4 en 4 (Amex 4-6-5) solo para mostrar; se envían únicamente dígitos.
-  inputs.number.addEventListener('input', function () {
-    var d = digits(this.value).slice(0, 19);
-    this.value = /^3[47]/.test(d)
-      ? [d.slice(0, 4), d.slice(4, 10), d.slice(10, 15)].filter(Boolean).join(' ')
-      : d.replace(/(\d{4})(?=\d)/g, '$1 ');
-  });
-  inputs.exp.addEventListener('input', function (e) {
-    var d = digits(this.value).slice(0, 4);
-    // Al borrar la barra no la volvemos a poner.
-    if (e.inputType === 'deleteContentBackward' && d.length <= 2) {
-      this.value = d;
-      return;
+  // Formato mientras se escribe. Agrupa de 4 en 4 (Amex 4-6-5) solo para mostrar;
+  // se envían únicamente dígitos.
+  document.addEventListener('input', function (e) {
+    var el = e.target;
+    if (!el || !el.closest || !el.closest('.mft-azul')) return;
+    var field = el.getAttribute('data-field');
+    if (field === 'number') {
+      var d = digits(el.value).slice(0, 19);
+      el.value = /^3[47]/.test(d)
+        ? [d.slice(0, 4), d.slice(4, 10), d.slice(10, 15)].filter(Boolean).join(' ')
+        : d.replace(/(\d{4})(?=\d)/g, '$1 ');
+    } else if (field === 'exp') {
+      var x = digits(el.value).slice(0, 4);
+      // Al borrar la barra no la volvemos a poner.
+      el.value = e.inputType === 'deleteContentBackward' && x.length <= 2
+        ? x
+        : x.length >= 2 ? x.slice(0, 2) + '/' + x.slice(2) : x;
+    } else if (field === 'cvc') {
+      el.value = digits(el.value).slice(0, 4);
     }
-    this.value = d.length >= 2 ? d.slice(0, 2) + '/' + d.slice(2) : d;
   });
-  inputs.cvc.addEventListener('input', function () {
-    this.value = digits(this.value).slice(0, 4);
-  });
-  Object.keys(inputs).forEach(function (k) {
-    inputs[k].addEventListener('keydown', function (e) {
-      if (e.key === 'Enter') payBtn.click();
-    });
+
+  // Enter en la página de pago de la orden = botón Pagar (en el checkout, Enter
+  // ya envía el formulario de WooCommerce).
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Enter' || isCheckout()) return;
+    if (e.target && e.target.closest && e.target.closest('.mft-azul') && e.target.hasAttribute('data-field')) {
+      e.preventDefault();
+      var btn = part('.mft-azul__pay');
+      if (btn) btn.click();
+    }
   });
 
   function luhn(n) {
@@ -85,48 +114,80 @@
 
   // Validación local (el plugin vuelve a validar todo).
   function validate() {
-    var name = inputs.name.value.trim();
+    if (!root()) return { field: '', message: msg.generic };
+    var name = value('name').trim();
     if (!name || name.length > 60) return { field: 'name', message: 'Escribe el nombre como aparece en la tarjeta.' };
-    var n = digits(inputs.number.value);
+    var n = digits(value('number'));
     if (n.length < 13 || n.length > 19 || !luhn(n)) return { field: 'number', message: 'El número de tarjeta no es válido.' };
-    var exp = parseExp(inputs.exp.value);
+    var exp = parseExp(value('exp'));
     var now = new Date();
     if (!exp || exp.year < now.getFullYear() || (exp.year === now.getFullYear() && exp.month < now.getMonth() + 1)) {
       return { field: 'exp', message: 'La fecha de vencimiento no es válida.' };
     }
-    var c = digits(inputs.cvc.value);
+    var c = digits(value('cvc'));
     if (c.length < 3 || c.length > 4) return { field: 'cvc', message: 'El código de seguridad no es válido.' };
     return null;
   }
 
   function showError(err) {
-    Object.keys(inputs).forEach(function (k) {
-      inputs[k].classList.toggle('is-invalid', !!err && err.field === k);
-      inputs[k].setAttribute('aria-invalid', err && err.field === k ? 'true' : 'false');
+    FIELDS.forEach(function (k) {
+      var el = input(k);
+      if (!el) return;
+      el.classList.toggle('is-invalid', !!err && err.field === k);
+      el.setAttribute('aria-invalid', err && err.field === k ? 'true' : 'false');
     });
-    errorEl.hidden = !err;
-    errorEl.textContent = err ? err.message : '';
-    if (err && inputs[err.field]) inputs[err.field].focus();
+    var box = part('.mft-azul__error');
+    if (box) {
+      box.hidden = !err;
+      box.textContent = err ? err.message : '';
+    }
+    if (err && input(err.field)) {
+      input(err.field).focus();
+      if (box) box.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
   }
 
   function showNotice(message) {
-    noticeEl.hidden = !message;
-    noticeEl.textContent = message || '';
-    if (message) noticeEl.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    var box = part('.mft-azul__notice');
+    if (!box) return;
+    box.hidden = !message;
+    box.textContent = message || '';
+    if (message) box.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }
+
+  // El checkout queda bloqueado por WooCommerce mientras "procesa": se libera al
+  // terminar sin redirigir, para que el cliente pueda corregir y volver a pagar.
+  function releaseCheckout() {
+    if (!$ || !isCheckout()) return;
+    var $form = $('form.checkout');
+    $form.removeClass('processing');
+    if ($form.unblock) $form.unblock();
   }
 
   function setBusy(stage) {
     busy = !!stage;
-    root.setAttribute('data-busy', busy ? '1' : '0');
+    if (!overlay) {
+      overlay = document.createElement('div');
+      overlay.className = 'mft-azul__overlay';
+      overlay.setAttribute('role', 'status');
+      overlay.innerHTML = '<span class="mft-azul__spinner" aria-hidden="true"></span>' +
+        '<strong class="mft-azul__stage"></strong><span>No cierres ni recargues esta ventana.</span>';
+      overlay.hidden = true;
+      document.body.appendChild(overlay);
+    }
     overlay.hidden = !busy;
-    payBtn.disabled = busy;
-    Object.keys(inputs).forEach(function (k) {
-      inputs[k].disabled = busy;
+    var btn = part('.mft-azul__pay');
+    if (btn) btn.disabled = busy;
+    FIELDS.forEach(function (k) {
+      var el = input(k);
+      if (el) el.disabled = busy;
     });
     if (busy) {
-      stageEl.textContent = stage === 'authenticating'
+      overlay.querySelector('.mft-azul__stage').textContent = stage === 'authenticating'
         ? 'Verificando con tu banco...'
         : stage === 'checking' ? (msg.checking || 'Confirmando tu pago...') : 'Procesando tu pago...';
+    } else {
+      releaseCheckout();
     }
   }
 
@@ -162,8 +223,8 @@
       headers: { Accept: 'application/json' },
     };
     if (method === 'GET') {
-      url += (url.indexOf('?') === -1 ? '?' : '&') + 'order_id=' + encodeURIComponent(cfg.orderId) +
-        '&order_key=' + encodeURIComponent(cfg.orderKey) + '&_=' + Date.now();
+      url += (url.indexOf('?') === -1 ? '?' : '&') + 'order_id=' + encodeURIComponent(order.id) +
+        '&order_key=' + encodeURIComponent(order.key) + '&_=' + Date.now();
     } else {
       opts.headers['Content-Type'] = 'application/json';
       opts.body = JSON.stringify(body);
@@ -251,7 +312,8 @@
           }
           if (Date.now() >= deadline) {
             setBusy(null);
-            payBtn.disabled = true;
+            var btn = part('.mft-azul__pay');
+            if (btn) btn.disabled = true;
             showNotice(msg.unknown);
             return null;
           }
@@ -269,11 +331,11 @@
     form.style.display = 'none';
     // `creq` va en minúscula: el ACS es case sensitive (doc AZUL 3DS, paso 4).
     [['creq', creq], ['TermUrl', termUrl]].forEach(function (pair) {
-      var input = document.createElement('input');
-      input.type = 'hidden';
-      input.name = pair[0];
-      input.value = pair[1];
-      form.appendChild(input);
+      var el = document.createElement('input');
+      el.type = 'hidden';
+      el.name = pair[0];
+      el.value = pair[1];
+      form.appendChild(el);
     });
     document.body.appendChild(form);
     leaving = true;
@@ -281,8 +343,10 @@
   }
 
   function clearSensitive() {
-    inputs.number.value = '';
-    inputs.cvc.value = '';
+    ['number', 'cvc'].forEach(function (k) {
+      var el = input(k);
+      if (el) el.value = '';
+    });
   }
 
   function finish(res) {
@@ -298,7 +362,8 @@
     // Se limpian los datos sensibles tras cada intento fallido.
     clearSensitive();
     if (res.status === 'pending') {
-      payBtn.disabled = true;
+      var btn = part('.mft-azul__pay');
+      if (btn) btn.disabled = true;
       showNotice(res.message || msg.unknown);
       return null;
     }
@@ -318,24 +383,27 @@
     return checkStatus();
   }
 
-  payBtn.addEventListener('click', function () {
+  function pay() {
     if (busy) return;
     var err = validate();
     showError(err);
-    if (err) return;
+    if (err) {
+      releaseCheckout();
+      return;
+    }
     showNotice('');
     setBusy('paying');
 
-    var exp = parseExp(inputs.exp.value);
+    var exp = parseExp(value('exp'));
     request('POST', '/pay', {
-      order_id: cfg.orderId,
-      order_key: cfg.orderKey,
+      order_id: order.id,
+      order_key: order.key,
       card: {
-        name: inputs.name.value.trim(),
-        number: digits(inputs.number.value),
+        name: value('name').trim(),
+        number: digits(value('number')),
         expMonth: exp.month,
         expYear: exp.year,
-        cvc: digits(inputs.cvc.value),
+        cvc: digits(value('cvc')),
       },
       browser: browserInfo(),
     })
@@ -345,7 +413,7 @@
         setBusy('authenticating');
         var unmount = mountMethodForm(res.methodForm);
         return waitMethodNotification()
-          .then(function () { return request('POST', '/continue', { order_id: cfg.orderId, order_key: cfg.orderKey }); })
+          .then(function () { return request('POST', '/continue', { order_id: order.id, order_key: order.key }); })
           .finally(unmount);
       })
       .then(finish)
@@ -355,5 +423,57 @@
         setBusy(null);
         showNotice(msg.generic);
       });
+  }
+
+  // --- Página de pago de la orden ---------------------------------------------
+  document.addEventListener('click', function (e) {
+    var btn = e.target && e.target.closest ? e.target.closest('.mft-azul__pay') : null;
+    var r = root();
+    if (!btn || !r || r.getAttribute('data-context') !== 'receipt') return;
+    order = { id: Number(r.getAttribute('data-order-id')), key: r.getAttribute('data-order-key') };
+    pay();
   });
+
+  // --- Checkout ---------------------------------------------------------------
+  // Le dice a process_payment que este script cobrará en el checkout (si no,
+  // WooCommerce manda a la página de pago de la orden).
+  function markInline() {
+    var el = document.getElementById('mft-azul-inline');
+    if (el) el.value = '1';
+  }
+
+  // WooCommerce redirige a `#mft-azul-pay:<orden>:<key>` tras crear la orden.
+  function fromHash() {
+    var m = HASH.exec(window.location.hash);
+    if (!m) return;
+    // Se limpia el hash: un segundo intento debe volver a disparar hashchange.
+    history.replaceState(null, '', window.location.pathname + window.location.search);
+    order = { id: Number(m[1]), key: m[2] };
+    if (!root() && payUrl) {
+      // No hay formulario (no debería pasar): la página de pago de la orden lo tiene.
+      go(payUrl);
+      return;
+    }
+    pay();
+  }
+
+  var payUrl = '';
+  if ($) {
+    // Antes de la redirección: guarda la página de pago de la orden como respaldo.
+    $('form.checkout').on('checkout_place_order_success', function (e, result) {
+      if (result && typeof result.mftAzulPayUrl === 'string') payUrl = result.mftAzulPayUrl;
+    });
+    $(document.body).on('updated_checkout payment_method_selected', markInline);
+    // Valida la tarjeta antes de que WooCommerce cree la orden.
+    $('form.checkout').on('checkout_place_order_' + (cfg.gatewayId || 'mft_azul_api'), function () {
+      if (busy) return false;
+      markInline();
+      var err = validate();
+      showError(err);
+      return !err;
+    });
+  }
+  markInline();
+  window.addEventListener('hashchange', fromHash);
+  fromHash();
 })();

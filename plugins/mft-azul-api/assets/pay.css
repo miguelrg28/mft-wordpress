@@ -65,8 +65,40 @@
   font-size: 0.75rem;
   opacity: 0.7;
 }
-.mft-azul [hidden] {
+.mft-azul [hidden],
+.mft-azul__overlay[hidden] {
   display: none !important;
+}
+/* Dentro del bloque de pagos del checkout: sin caja propia. */
+.mft-azul--checkout {
+  max-width: none;
+  margin: 0.75rem 0 0;
+  padding: 0;
+  border: 0;
+}
+.mft-azul--checkout .mft-azul__field {
+  margin-bottom: 0.75rem;
+}
+.mft-azul .required {
+  text-decoration: none;
+  border: 0;
+}
+/* Los logos van en su propia línea, debajo del título del método. */
+.payment_method_mft_azul_api > label {
+  flex-wrap: wrap;
+}
+.mft-azul__brands-icons {
+  display: flex;
+  flex-basis: 100%;
+  gap: 0.3rem;
+  margin: 0.4rem 0 0;
+}
+.mft-azul__brands-icons .mft-azul__brand {
+  width: 36px;
+  height: auto;
+  max-height: 24px;
+  margin: 0;
+  float: none;
 }
 .mft-azul__overlay {
   position: fixed;

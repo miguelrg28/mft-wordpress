@@ -2,7 +2,7 @@
 /**
  * Plugin Name: MFT AZUL API (pago con tarjeta + 3D Secure 2.0)
  * Description: Método de pago de WooCommerce que cobra con tarjeta dentro del sitio usando la "Integración vía API" de AZUL (JSON + autenticación mutua) con 3D Secure 2.0. Convive con la "Página de Pago AZUL": son métodos distintos.
- * Version: 0.2.0
+ * Version: 0.3.0
  * Requires Plugins: woocommerce
  *
  * ---------------------------------------------------------------------------
@@ -38,13 +38,22 @@
  *                            /method-status hasta 10 s y se llama /continue.
  *    - IsoCode 3D          → POST (creq) al RedirectPostUrl del ACS del banco;
  *                            el ACS vuelve a /term (TermUrl) y aquí se completa.
- *  Timeouts: VerifyPayment por cron (nunca se reintenta un cobro a ciegas).
+ *
+ * GARANTÍAS
+ *  - Un solo cobro por orden: candado atómico por orden y, ya con el candado, se
+ *    vuelve a leer la orden. Una aprobación de AZUL se guarda (`_mft_azul_charged`)
+ *    antes de completar la orden, así un fallo al completarla nunca lleva a cobrar
+ *    otra vez.
+ *  - Resultado desconocido (timeout, respuesta inválida, error inesperado con una
+ *    llamada en curso): nunca se reintenta a ciegas; se verifica con VerifyPayment.
+ *  - Todo error llega al cliente como un mensaje en español y sin detalles
+ *    técnicos; el detalle va a la nota privada de la orden y al log.
  */
 
 defined('ABSPATH') || exit;
 
 define('MFT_AZUL_API_ID', 'mft_azul_api');
-define('MFT_AZUL_API_VERSION', '0.2.0');
+define('MFT_AZUL_API_VERSION', '0.3.0');
 
 // Endpoints JSON. El método va en el query string (Default.aspx sin query =
 // ProcessPayment).
@@ -54,6 +63,30 @@ const MFT_AZUL_API_URLS = [
         'https://pagos.azul.com.do/WebServices/JSON/Default.aspx',
         'https://contpagos.azul.com.do/WebServices/JSON/Default.aspx', // sitio alterno
     ],
+];
+
+// Cloudflare corta a los 100 s: AZUL debe responder (o vencer) antes, para que
+// el servidor y no el navegador decida qué hacer con un resultado desconocido.
+const MFT_AZUL_API_TIMEOUT = 85;
+
+// AZUL solo cobra en pesos dominicanos con este comercio (CurrencyPosCode "$").
+const MFT_AZUL_API_CURRENCY = 'DOP';
+
+/** Mensajes para el cliente. Nunca llevan detalles técnicos. */
+const MFT_AZUL_API_MSG = [
+    'generic' => 'No pudimos procesar el pago. Intenta de nuevo en unos minutos.',
+    'connect' => 'No pudimos conectar con el procesador de pagos. Intenta de nuevo en unos minutos.',
+    'unknown' => 'No recibimos la confirmación del banco. No intentes pagar de nuevo: verificaremos tu pago en unos minutos y te avisaremos por correo.',
+    'verifying' => 'Estamos confirmando un intento de pago anterior. Intenta de nuevo en unos minutos.',
+    'busy' => 'Ya hay un pago en proceso para esta orden. Espera unos segundos.',
+    'unavailable' => 'El pago con tarjeta no está disponible en este momento. Elige otro método de pago o intenta más tarde.',
+    'order' => 'No encontramos esta orden. Vuelve a abrir el enlace de pago desde tu correo o desde Mi cuenta.',
+    'expired' => 'Esta orden ya no admite pagos (puede haber expirado). Vuelve a hacer tu pedido.',
+    'attempts' => 'Se alcanzó el máximo de intentos para esta orden. Contáctanos para completar tu compra.',
+    'rate' => 'Demasiados intentos de pago. Espera un rato antes de volver a intentar.',
+    'auth' => 'No se completó la autenticación con tu banco. Intenta de nuevo.',
+    'declined' => 'Pago declinado por el banco emisor. Intenta con otra tarjeta o contacta a tu banco.',
+    'card' => 'No pudimos procesar el pago. Verifica los datos de tu tarjeta e intenta de nuevo.',
 ];
 
 // ===========================================================================
@@ -199,7 +232,7 @@ add_action('plugins_loaded', function () {
                 'debug' => [
                     'title' => 'Log de depuración',
                     'type' => 'checkbox',
-                    'label' => 'Registrar respuestas en WooCommerce → Estado → Registros (fuente mft-azul-api). Nunca registra datos de tarjeta.',
+                    'label' => 'Registrar respuestas en WooCommerce → Estado → Registros (fuente mft-azul-api). Nunca registra datos de tarjeta. Los errores se registran siempre.',
                     'default' => 'no',
                 ],
             ];
@@ -233,7 +266,7 @@ add_action('plugins_loaded', function () {
 
         /**
          * Administradores de la tienda y probadores (por correo). Las tarjetas de
-         * prueba de AZUL son públicas: en Pruebas nadie más puede ver el método,
+         * prueba de AZUL son públicas: en Pruebas nadie más puede usar el método,
          * o cualquiera "pagaría" boletos sin pagar.
          */
         public function is_tester()
@@ -254,19 +287,28 @@ add_action('plugins_loaded', function () {
             if (($this->is_test() || $this->get_option('only_admins', 'yes') === 'yes') && !$this->is_tester()) {
                 return false;
             }
+            if (get_woocommerce_currency() !== MFT_AZUL_API_CURRENCY) {
+                return false;
+            }
             return parent::is_available() && $this->is_configured();
         }
 
         /**
          * Al colocar la orden no se cobra todavía: queda `pending` y el cliente
          * pasa a la página de pago de la orden, donde escribe la tarjeta.
+         * WooCommerce solo llega aquí si el método está disponible para este
+         * usuario, así que la marca `_mft_azul_allowed` autoriza a pagar la orden
+         * con /pay (ver mft_azul_api_order_from_request).
          */
         public function process_payment($order_id)
         {
             $order = wc_get_order($order_id);
             if (!$order) {
+                wc_add_notice(MFT_AZUL_API_MSG['generic'], 'error');
                 return ['result' => 'failure'];
             }
+            $order->update_meta_data('_mft_azul_allowed', $this->is_test() ? 'test' : 'prod');
+            $order->save();
             if (!$order->has_status('pending')) {
                 $order->update_status('pending');
             }
@@ -283,6 +325,10 @@ add_action('plugins_loaded', function () {
             if (!$order) {
                 return;
             }
+            if (!$this->is_configured() || $order->get_currency() !== MFT_AZUL_API_CURRENCY) {
+                echo '<p class="woocommerce-error">' . esc_html(MFT_AZUL_API_MSG['unavailable']) . '</p>';
+                return;
+            }
             $notice = (string) $order->get_meta('_mft_azul_notice');
             if ($notice !== '') {
                 $order->delete_meta_data('_mft_azul_notice');
@@ -295,27 +341,36 @@ add_action('plugins_loaded', function () {
                 'api' => untrailingslashit(rest_url('mft/v1/azul-api')),
                 'orderId' => $order->get_id(),
                 'orderKey' => $order->get_order_key(),
+                'msg' => [
+                    'generic' => MFT_AZUL_API_MSG['generic'],
+                    'connect' => 'No pudimos comunicarnos con el sitio. Revisa tu conexión a internet e intenta de nuevo.',
+                    'checking' => 'Estamos confirmando el resultado de tu pago...',
+                    'unknown' => MFT_AZUL_API_MSG['unknown'],
+                    'method' => 'No se pudo completar la verificación con tu banco. Intenta de nuevo.',
+                    'leave' => 'Tu pago se está procesando. Si sales ahora podrías no ver el resultado.',
+                ],
             ]);
             ?>
             <div class="mft-azul" id="mft-azul" data-busy="0">
                 <p class="mft-azul__notice" role="alert"<?php echo $notice === '' ? ' hidden' : ''; ?>><?php echo esc_html($notice); ?></p>
+                <noscript><p class="mft-azul__notice">Para pagar con tarjeta necesitas activar JavaScript en tu navegador.</p></noscript>
                 <?php // Sin <form> ni atributos name: la tarjeta nunca viaja por un submit nativo. ?>
                 <div class="mft-azul__field">
                     <label for="mft-cc-name">Nombre en la tarjeta</label>
-                    <input id="mft-cc-name" type="text" autocomplete="cc-name" data-field="name">
+                    <input id="mft-cc-name" type="text" autocomplete="cc-name" maxlength="60" data-field="name">
                 </div>
                 <div class="mft-azul__field">
                     <label for="mft-cc-number">Número de tarjeta</label>
-                    <input id="mft-cc-number" type="text" inputmode="numeric" autocomplete="cc-number" placeholder="0000 0000 0000 0000" data-field="number">
+                    <input id="mft-cc-number" type="text" inputmode="numeric" autocomplete="cc-number" maxlength="23" placeholder="0000 0000 0000 0000" data-field="number">
                 </div>
                 <div class="mft-azul__row">
                     <div class="mft-azul__field">
                         <label for="mft-cc-exp">Vencimiento</label>
-                        <input id="mft-cc-exp" type="text" inputmode="numeric" autocomplete="cc-exp" placeholder="MM/AA" data-field="exp">
+                        <input id="mft-cc-exp" type="text" inputmode="numeric" autocomplete="cc-exp" maxlength="7" placeholder="MM/AA" data-field="exp">
                     </div>
                     <div class="mft-azul__field">
                         <label for="mft-cc-csc">CVC</label>
-                        <input id="mft-cc-csc" type="text" inputmode="numeric" autocomplete="cc-csc" placeholder="123" data-field="cvc">
+                        <input id="mft-cc-csc" type="text" inputmode="numeric" autocomplete="cc-csc" maxlength="4" placeholder="123" data-field="cvc">
                     </div>
                 </div>
                 <p class="mft-azul__error" role="alert" hidden></p>
@@ -335,7 +390,8 @@ add_action('plugins_loaded', function () {
 
         /**
          * Reembolso desde el admin: anulación (ProcessVoid) si es total y dentro de
-         * los 20 minutos de aprobada; si no, devolución (Refund).
+         * los 20 minutos de aprobada; si no (o si AZUL ya no permite anular),
+         * devolución (Refund).
          */
         public function process_refund($order_id, $amount = null, $reason = '')
         {
@@ -344,81 +400,103 @@ add_action('plugins_loaded', function () {
                 return new WP_Error('mft_azul', 'Orden no encontrada.');
             }
             $azul_order_id = (string) $order->get_meta('_mft_azul_order_id');
-            if ($azul_order_id === '') {
-                return new WP_Error('mft_azul', 'La orden no tiene AzulOrderId; reembolsa desde el portal de AZUL.');
+            if ($azul_order_id === '' || !$order->get_meta('_mft_azul_charged')) {
+                return new WP_Error('mft_azul', 'La orden no tiene un cobro AZUL API aprobado; revisa en el portal de AZUL.');
+            }
+            if (!mft_azul_api_lock($order->get_id())) {
+                return new WP_Error('mft_azul', 'Hay otra operación de pago en curso para esta orden. Intenta en un minuto.');
             }
 
-            $amount = (float) ($amount === null ? $order->get_total() : $amount);
-            $is_full = abs($amount - (float) $order->get_total()) < 0.01;
-            $approved_at = (int) $order->get_meta('_mft_azul_approved_at');
-            // Margen de 1 minuto sobre el límite de 20 de AZUL.
-            $can_void = $is_full && $approved_at > 0 && (time() - $approved_at) < 19 * MINUTE_IN_SECONDS
-                && !$order->get_meta('_mft_azul_voided');
+            try {
+                $amount = (float) ($amount === null ? $order->get_total() : $amount);
+                if ($amount <= 0) {
+                    return new WP_Error('mft_azul', 'El monto a reembolsar debe ser mayor que cero.');
+                }
+                $is_full = abs($amount - (float) $order->get_total()) < 0.01;
+                $approved_at = (int) $order->get_meta('_mft_azul_approved_at');
+                // Margen de 1 minuto sobre el límite de 20 de AZUL.
+                $can_void = $is_full && $approved_at > 0 && (time() - $approved_at) < 19 * MINUTE_IN_SECONDS
+                    && !$order->get_meta('_mft_azul_voided');
 
-            if ($can_void) {
-                $res = mft_azul_api_call('ProcessVoid', [
-                    'Channel' => $this->get_option('channel'),
-                    'Store' => $this->get_option('store'),
-                    'AzulOrderId' => $azul_order_id,
-                ]);
-                $label = 'Anulación (Void)';
-            } else {
-                $cents = mft_azul_api_cents($amount);
-                $total_cents = mft_azul_api_cents($order->get_total());
-                $itbis = $total_cents > 0
-                    ? (int) round(mft_azul_api_itbis_cents($order, $total_cents) * $cents / $total_cents)
-                    : 0;
-                $refunds = (int) $order->get_meta('_mft_azul_refund_count') + 1;
-                $order->update_meta_data('_mft_azul_refund_count', $refunds);
-                $order->save();
+                $res = null;
+                $label = '';
+                if ($can_void) {
+                    $label = 'Anulación (Void)';
+                    $res = mft_azul_api_call('ProcessVoid', [
+                        'Channel' => $this->get_option('channel'),
+                        'Store' => $this->get_option('store'),
+                        'AzulOrderId' => $azul_order_id,
+                    ]);
+                    // AZUL ya cerró el lote: se pasa a devolución.
+                    if (!is_wp_error($res) && ($res['IsoCode'] ?? '') !== '00') {
+                        $order->add_order_note('Anulación AZUL no permitida (' . mft_azul_api_detail($res) . '); se intenta devolución.');
+                        $can_void = false;
+                        $res = null;
+                    }
+                }
+                if (!$can_void) {
+                    $label = 'Devolución (Refund)';
+                    $cents = mft_azul_api_cents($amount);
+                    $total_cents = mft_azul_api_cents($order->get_total());
+                    $itbis = $total_cents > 0
+                        ? (int) round(mft_azul_api_itbis_cents($order, $total_cents) * $cents / $total_cents)
+                        : 0;
+                    $refunds = (int) $order->get_meta('_mft_azul_refund_count') + 1;
+                    $order->update_meta_data('_mft_azul_refund_count', $refunds);
+                    $order->save();
+                    $ref = mft_azul_api_attempt_ref($order, 'R' . $refunds);
 
-                $res = mft_azul_api_call('ProcessPayment', [
-                    'Channel' => $this->get_option('channel'),
-                    'Store' => $this->get_option('store'),
-                    'PosInputMode' => $this->get_option('pos_input_mode'),
-                    'TrxType' => 'Refund',
-                    'Amount' => (string) $cents,
-                    'Itbis' => mft_azul_api_format_itbis($itbis),
-                    'CurrencyPosCode' => '$',
-                    'Payments' => '1',
-                    'Plan' => '0',
-                    'OriginalDate' => substr((string) $order->get_meta('_mft_azul_datetime'), 0, 8),
-                    'AcquirerRefData' => '',
-                    'RRN' => null,
-                    'AzulOrderId' => $azul_order_id,
-                    'CustomerServicePhone' => $this->get_option('customer_service_phone'),
-                    'OrderNumber' => mft_azul_api_attempt_ref($order, 'R' . $refunds),
-                    'ECommerceUrl' => $this->get_option('ecommerce_url'),
-                    'CustomOrderId' => mft_azul_api_attempt_ref($order, 'R' . $refunds),
-                    'DataVaultToken' => '',
-                    'ForceNo3DS' => '1',
-                    'SaveToDataVault' => '0',
-                ]);
-                $label = 'Devolución (Refund)';
-            }
+                    $res = mft_azul_api_call('ProcessPayment', [
+                        'Channel' => $this->get_option('channel'),
+                        'Store' => $this->get_option('store'),
+                        'PosInputMode' => $this->get_option('pos_input_mode'),
+                        'TrxType' => 'Refund',
+                        'Amount' => (string) $cents,
+                        'Itbis' => mft_azul_api_format_itbis($itbis),
+                        'CurrencyPosCode' => '$',
+                        'Payments' => '1',
+                        'Plan' => '0',
+                        'OriginalDate' => substr((string) $order->get_meta('_mft_azul_datetime'), 0, 8),
+                        'AcquirerRefData' => '',
+                        'RRN' => null,
+                        'AzulOrderId' => $azul_order_id,
+                        'CustomerServicePhone' => $this->get_option('customer_service_phone'),
+                        'OrderNumber' => $ref,
+                        'ECommerceUrl' => $this->get_option('ecommerce_url'),
+                        'CustomOrderId' => $ref,
+                        'DataVaultToken' => '',
+                        'ForceNo3DS' => '1',
+                        'SaveToDataVault' => '0',
+                    ]);
+                }
 
-            if (is_wp_error($res)) {
-                $order->add_order_note($label . ' AZUL sin respuesta: ' . $res->get_error_message() . '. Verifica en el portal de AZUL antes de reintentar.');
-                return $res;
-            }
-            if (($res['IsoCode'] ?? '') !== '00') {
-                $msg = trim(($res['ResponseMessage'] ?? '') . ' ' . ($res['ErrorDescription'] ?? ''));
-                $order->add_order_note($label . ' AZUL rechazada: ' . $msg);
-                return new WP_Error('mft_azul', $label . ' rechazada por AZUL: ' . $msg);
-            }
+                if (is_wp_error($res)) {
+                    $order->add_order_note($label . ' AZUL sin respuesta: ' . $res->get_error_message() . '. Verifica en el portal de AZUL antes de reintentar.');
+                    return new WP_Error('mft_azul', $label . ' sin respuesta de AZUL. Verifica en el portal de AZUL antes de reintentar.');
+                }
+                if (($res['IsoCode'] ?? '') !== '00') {
+                    $order->add_order_note($label . ' AZUL rechazada: ' . mft_azul_api_detail($res));
+                    return new WP_Error('mft_azul', $label . ' rechazada por AZUL: ' . mft_azul_api_detail($res));
+                }
 
-            if ($can_void) {
-                $order->update_meta_data('_mft_azul_voided', 1);
-                $order->save();
+                if ($can_void) {
+                    $order->update_meta_data('_mft_azul_voided', 1);
+                    $order->save();
+                }
+                $order->add_order_note(sprintf(
+                    '%s AZUL aprobada por %s. Autorización: %s%s',
+                    $label,
+                    wc_price($amount),
+                    $res['AuthorizationCode'] ?? '',
+                    $reason ? ' · Motivo: ' . $reason : ''
+                ));
+                return true;
+            } catch (Throwable $e) {
+                mft_azul_api_log_error('refund', $e);
+                return new WP_Error('mft_azul', 'Error inesperado al reembolsar. Verifica en el portal de AZUL antes de reintentar.');
+            } finally {
+                mft_azul_api_unlock($order->get_id());
             }
-            $order->add_order_note(sprintf(
-                '%s AZUL aprobada por %s. Autorización: %s%s',
-                $label,
-                wc_price($amount),
-                $res['AuthorizationCode'] ?? '',
-                $reason ? ' · Motivo: ' . $reason : ''
-            ));
-            return true;
         }
     }
 
@@ -456,7 +534,7 @@ function mft_azul_api_itbis_cents($order, $amount_cents)
         return (int) round($amount_cents - $amount_cents / 1.18);
     }
     if ($mode === 'order') {
-        return mft_azul_api_cents($order->get_total_tax());
+        return min($amount_cents, mft_azul_api_cents($order->get_total_tax()));
     }
     return 0;
 }
@@ -467,17 +545,54 @@ function mft_azul_api_format_itbis($cents)
     return $cents > 0 ? (string) $cents : '000';
 }
 
+/** Detalle técnico de una respuesta de AZUL (solo para notas privadas y log). */
+function mft_azul_api_detail($res)
+{
+    if (is_wp_error($res)) {
+        return $res->get_error_message();
+    }
+    return trim(sprintf(
+        'ResponseCode: %s · IsoCode: %s · %s %s',
+        $res['ResponseCode'] ?? '',
+        $res['IsoCode'] ?? '',
+        $res['ResponseMessage'] ?? '',
+        $res['ErrorDescription'] ?? ''
+    ));
+}
+
+/** Quita cualquier dato de tarjeta antes de registrar algo. */
+function mft_azul_api_redact(array $context)
+{
+    foreach (['CardNumber', 'CVC', 'Expiration', 'card', 'number', 'cvc'] as $k) {
+        unset($context[$k]);
+    }
+    return $context;
+}
+
 function mft_azul_api_log($message, $context = [])
 {
     $gw = mft_azul_api_gateway();
     if (!$gw || $gw->get_option('debug') !== 'yes' || !function_exists('wc_get_logger')) {
         return;
     }
-    // Defensa extra: jamás registrar datos de tarjeta aunque llegaran en $context.
-    foreach (['CardNumber', 'CVC', 'Expiration', 'card'] as $k) {
-        unset($context[$k]);
-    }
+    $context = mft_azul_api_redact((array) $context);
     wc_get_logger()->info($message . ($context ? ' ' . wp_json_encode($context) : ''), ['source' => 'mft-azul-api']);
+}
+
+/** Los errores inesperados se registran siempre (sin datos de tarjeta). */
+function mft_azul_api_log_error($where, Throwable $e)
+{
+    if (!function_exists('wc_get_logger')) {
+        return;
+    }
+    wc_get_logger()->error(sprintf(
+        '%s: %s: %s en %s:%d',
+        $where,
+        get_class($e),
+        $e->getMessage(),
+        basename($e->getFile()),
+        $e->getLine()
+    ), ['source' => 'mft-azul-api']);
 }
 
 /**
@@ -502,6 +617,9 @@ function mft_azul_api_call($method, array $payload)
     $env = $gw->get_option('environment') === 'prod' ? 'prod' : 'test';
     $query = $method === 'ProcessPayment' ? '' : '?' . $method;
     $body = wp_json_encode($payload);
+    if ($body === false) {
+        return new WP_Error('azul_config', 'No se pudo armar la petición a AZUL.');
+    }
     $last_error = null;
 
     foreach (MFT_AZUL_API_URLS[$env] as $base) {
@@ -521,9 +639,10 @@ function mft_azul_api_call($method, array $payload)
             CURLOPT_SSLVERSION => CURL_SSLVERSION_TLSv1_2,
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_SSL_VERIFYHOST => 2,
-            CURLOPT_CONNECTTIMEOUT => 15,
-            // AZUL recomienda hasta 120 s (el emisor puede demorar la aprobación).
-            CURLOPT_TIMEOUT => 120,
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_TIMEOUT => MFT_AZUL_API_TIMEOUT,
         ];
         $pass = $gw->secret('key_pass');
         if ($pass !== '') {
@@ -540,7 +659,7 @@ function mft_azul_api_call($method, array $payload)
         if ($errno) {
             // Solo pasamos al sitio alterno si la petición no llegó a enviarse.
             // Un timeout tras enviar podría haber cobrado: no se repite.
-            $connect_errors = [CURLE_COULDNT_RESOLVE_HOST, CURLE_COULDNT_CONNECT, CURLE_SSL_CONNECT_ERROR];
+            $connect_errors = [CURLE_COULDNT_RESOLVE_HOST, CURLE_COULDNT_CONNECT, CURLE_SSL_CONNECT_ERROR, CURLE_SSL_CERTPROBLEM];
             if (in_array($errno, $connect_errors, true)) {
                 $last_error = new WP_Error('azul_connect', 'No se pudo conectar con AZUL: ' . $error);
                 mft_azul_api_log($method . ' connect error', ['url' => $base, 'error' => $error]);
@@ -555,7 +674,7 @@ function mft_azul_api_call($method, array $payload)
         }
         $data = json_decode((string) $raw, true);
         if (!is_array($data)) {
-            mft_azul_api_log($method . ' respuesta no JSON', ['raw' => substr((string) $raw, 0, 500)]);
+            mft_azul_api_log($method . ' respuesta no JSON', ['raw' => substr((string) $raw, 0, 300)]);
             return new WP_Error('azul_parse', 'Respuesta de AZUL no válida.');
         }
         // Algunas respuestas vienen envueltas (ej. {"ProcessPaymentResult": {...}}).
@@ -564,6 +683,10 @@ function mft_azul_api_call($method, array $payload)
             if (is_array($inner) && (isset($inner['IsoCode']) || isset($inner['ResponseCode']))) {
                 $data = $inner;
             }
+        }
+        if (!isset($data['IsoCode']) && !isset($data['ResponseCode'])) {
+            mft_azul_api_log($method . ' respuesta sin IsoCode', ['keys' => array_keys($data)]);
+            return new WP_Error('azul_parse', 'Respuesta de AZUL incompleta.');
         }
         mft_azul_api_log($method . ' OK', [
             'IsoCode' => $data['IsoCode'] ?? null,
@@ -579,34 +702,67 @@ function mft_azul_api_call($method, array $payload)
 }
 
 /**
- * Lock por orden para evitar cobros dobles (doble clic, dos pestañas).
- * add_option es atómico: falla si la opción ya existe (option_name es único).
+ * Candado por orden contra cobros dobles (doble clic, dos pestañas, el cron de
+ * VerifyPayment). INSERT IGNORE sobre la clave única de wp_options es atómico y
+ * no pasa por la caché de objetos (Redis); add_option no sirve: hace
+ * INSERT … ON DUPLICATE KEY UPDATE y consulta la caché antes.
  */
 function mft_azul_api_lock($order_id)
 {
+    global $wpdb;
     $name = 'mft_azul_lock_' . (int) $order_id;
-    if (add_option($name, time(), '', 'no')) {
-        return true;
-    }
-    $since = (int) get_option($name);
-    if ($since && time() - $since > 150) { // lock huérfano (> timeout de AZUL)
-        delete_option($name);
-        return add_option($name, time(), '', 'no');
-    }
-    return false;
+    // Candado huérfano (proceso que murió): más viejo que el timeout de AZUL.
+    $wpdb->query($wpdb->prepare(
+        "DELETE FROM {$wpdb->options} WHERE option_name = %s AND CAST(option_value AS UNSIGNED) < %d",
+        $name,
+        time() - (MFT_AZUL_API_TIMEOUT * 2 + 30)
+    ));
+    $ok = (int) $wpdb->query($wpdb->prepare(
+        "INSERT IGNORE INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no')",
+        $name,
+        (string) time()
+    ));
+    return $ok === 1;
 }
 
 function mft_azul_api_unlock($order_id)
 {
-    delete_option('mft_azul_lock_' . (int) $order_id);
+    global $wpdb;
+    $wpdb->delete($wpdb->options, ['option_name' => 'mft_azul_lock_' . (int) $order_id]);
 }
 
-/** Marca la orden como pagada (mismo criterio que la Página de Pago AZUL). */
+/** Lee la orden de nuevo desde la base (sin la copia en memoria de esta petición). */
+function mft_azul_api_fresh_order($order_id)
+{
+    if (function_exists('wp_cache_delete')) {
+        wp_cache_delete($order_id, 'posts');
+        wp_cache_delete($order_id, 'post_meta');
+        wp_cache_delete($order_id, 'orders');
+        wp_cache_delete('order-' . $order_id, 'orders');
+    }
+    return wc_get_order($order_id);
+}
+
+/** ¿AZUL ya aprobó un cobro para esta orden? (aunque completarla haya fallado) */
+function mft_azul_api_is_charged($order)
+{
+    return $order->is_paid() || (bool) $order->get_meta('_mft_azul_charged');
+}
+
+/**
+ * Marca la orden como pagada (mismo criterio que la Página de Pago AZUL).
+ * Primero se guarda la aprobación: si después falla completar la orden (un hook
+ * de otro plugin), nunca se vuelve a cobrar y queda una nota para revisar.
+ */
 function mft_azul_api_mark_paid($order, array $res)
 {
     if ($order->is_paid()) {
         return;
     }
+    $gw = mft_azul_api_gateway();
+    $test = !$gw || $gw->is_test();
+
+    $order->update_meta_data('_mft_azul_charged', (string) ($res['AzulOrderId'] ?? '1'));
     $order->update_meta_data('_mft_azul_order_id', (string) ($res['AzulOrderId'] ?? $order->get_meta('_mft_azul_order_id')));
     $order->update_meta_data('_mft_azul_authorization_code', (string) ($res['AuthorizationCode'] ?? ''));
     $order->update_meta_data('_mft_azul_rrn', (string) ($res['RRN'] ?? ''));
@@ -615,16 +771,11 @@ function mft_azul_api_mark_paid($order, array $res)
     $order->update_meta_data('AuthorizationCode', (string) ($res['AuthorizationCode'] ?? ''));
     $order->update_meta_data('_mft_azul_3ds_state', 'done');
     $order->delete_meta_data('_mft_azul_pending_verify');
-    $gw = mft_azul_api_gateway();
-    $test = !$gw || $gw->is_test();
+    $order->delete_meta_data('_mft_azul_inflight');
     if ($test) {
         $order->update_meta_data('_mft_azul_test', 1);
     }
     $order->save();
-
-    if ($test) {
-        $order->add_order_note('PAGO DE PRUEBA (AZUL pruebas): no se cobró dinero. No entregar ni despachar esta orden.');
-    }
 
     $order->add_order_note(sprintf(
         'AZUL API aprobado. Autorización: %s · RRN: %s · AzulOrderId: %s · Tarjeta ****%s',
@@ -633,9 +784,29 @@ function mft_azul_api_mark_paid($order, array $res)
         $res['AzulOrderId'] ?? $order->get_meta('_mft_azul_order_id'),
         $order->get_meta('_mft_azul_card_last4')
     ));
+    if ($test) {
+        $order->add_order_note('PAGO DE PRUEBA (AZUL pruebas): no se cobró dinero. No entregar ni despachar esta orden.');
+    }
+
     // payment_complete dispara los hooks de pago (FooEvents, stock, correos).
-    $order->payment_complete((string) ($res['AuthorizationCode'] ?? ''));
-    $order->update_status('completed', 'El pago ha sido completado');
+    // WooCommerce atrapa las excepciones de esos hooks y devuelve false.
+    $error = '';
+    try {
+        $ok = $order->payment_complete((string) ($res['AuthorizationCode'] ?? ''));
+        $order = mft_azul_api_fresh_order($order->get_id());
+        if ($ok && $order->is_paid()) {
+            $order->update_status('completed', 'El pago ha sido completado');
+            return;
+        }
+        $error = 'WooCommerce no pudo registrar el pago';
+    } catch (Throwable $e) {
+        mft_azul_api_log_error('payment_complete', $e);
+        $error = $e->getMessage();
+    }
+    if (function_exists('wc_get_logger')) {
+        wc_get_logger()->error('Orden ' . $order->get_id() . ' cobrada en AZUL sin completar: ' . $error, ['source' => 'mft-azul-api']);
+    }
+    $order->update_status('on-hold', 'ATENCIÓN: AZUL aprobó el cobro pero falló completar la orden (' . $error . '). NO cobrar de nuevo: revisa la orden y complétala manualmente.');
 }
 
 /** "Orden recibida" de WooCommerce (vacía el carrito al llegar). */
@@ -657,24 +828,40 @@ function mft_azul_api_customer_message(array $res)
 {
     $iso = (string) ($res['IsoCode'] ?? '');
     if (($res['ResponseCode'] ?? '') === 'Error') {
-        return 'No pudimos procesar el pago. Verifica los datos de tu tarjeta e intenta de nuevo.';
+        return MFT_AZUL_API_MSG['card'];
+    }
+    if (str_contains((string) ($res['ErrorDescription'] ?? ''), 'SGS-005003')) {
+        return 'El procesador de pagos no pudo registrar el intento. Espera unos segundos e intenta de nuevo; no se te cobró nada.';
     }
     if ($iso === '99') {
         return stripos((string) ($res['ErrorDescription'] ?? ''), '3D') !== false
             ? 'Tu banco no pudo autenticar la tarjeta (3D Secure). Intenta de nuevo o usa otra tarjeta.'
-            : 'No pudimos procesar el pago. Verifica los datos de tu tarjeta e intenta de nuevo.';
+            : MFT_AZUL_API_MSG['card'];
     }
     if ($iso === '08') {
         return 'Tu banco no pudo autenticar la tarjeta en este momento. Intenta más tarde o usa otra tarjeta.';
     }
-    $msg = trim((string) ($res['ResponseMessage'] ?? ''));
-    return $msg !== '' ? 'Pago declinado: ' . $msg . '.' : 'Pago declinado por el banco emisor.';
+    $known = [
+        '51' => 'Fondos insuficientes. Intenta con otra tarjeta.',
+        '54' => 'La tarjeta está vencida. Intenta con otra tarjeta.',
+        '05' => MFT_AZUL_API_MSG['declined'],
+        '14' => 'El número de tarjeta no es válido. Verifícalo e intenta de nuevo.',
+        '41' => MFT_AZUL_API_MSG['declined'],
+        '43' => MFT_AZUL_API_MSG['declined'],
+        '57' => 'Tu tarjeta no permite este tipo de compra. Contacta a tu banco o usa otra tarjeta.',
+        '61' => 'La compra supera el límite de tu tarjeta. Intenta con otra tarjeta.',
+        '82' => 'El código de seguridad (CVC) no es válido.',
+        'N7' => 'El código de seguridad (CVC) no es válido.',
+        '91' => 'Tu banco no responde en este momento. Intenta más tarde.',
+    ];
+    return $known[$iso] ?? MFT_AZUL_API_MSG['declined'];
 }
 
 /** Programa la verificación (VerifyPayment) de un intento con resultado desconocido. */
 function mft_azul_api_schedule_verify($order, $custom_order_id, $tries = 0)
 {
     $order->update_meta_data('_mft_azul_pending_verify', $custom_order_id);
+    $order->delete_meta_data('_mft_azul_inflight');
     $order->save();
     wp_schedule_single_event(time() + 5 * MINUTE_IN_SECONDS, 'mft_azul_api_verify', [$order->get_id(), $tries]);
 }
@@ -691,19 +878,19 @@ function mft_azul_api_handle_result($order, $res)
             $custom = (string) $order->get_meta('_mft_azul_custom_order_id');
             $order->add_order_note('AZUL API sin respuesta (' . $res->get_error_message() . '). Se verificará con VerifyPayment (' . $custom . ').');
             mft_azul_api_schedule_verify($order, $custom);
-            return [
-                'status' => 'pending',
-                'message' => 'No recibimos confirmación de AZUL. No intentes pagar de nuevo: verificaremos tu pago en unos minutos y te avisaremos por correo.',
-            ];
+            return ['status' => 'pending', 'message' => MFT_AZUL_API_MSG['unknown']];
         }
+        $order->delete_meta_data('_mft_azul_inflight');
+        $order->save();
         $order->add_order_note('AZUL API error: ' . $res->get_error_message());
-        return ['status' => 'error', 'message' => 'No pudimos conectar con el procesador de pagos. Intenta de nuevo en unos minutos.'];
+        return ['status' => 'error', 'message' => MFT_AZUL_API_MSG['connect']];
     }
 
     $iso = (string) ($res['IsoCode'] ?? '');
     if (!empty($res['AzulOrderId'])) {
         $order->update_meta_data('_mft_azul_order_id', (string) $res['AzulOrderId']);
     }
+    $order->delete_meta_data('_mft_azul_inflight');
 
     if ($iso === '00') {
         mft_azul_api_mark_paid($order, $res);
@@ -711,22 +898,28 @@ function mft_azul_api_handle_result($order, $res)
     }
 
     if ($iso === '3D2METHOD') {
+        $form = (string) ($res['ThreeDSMethod']['MethodForm'] ?? '');
         $order->update_meta_data('_mft_azul_3ds_state', 'method');
         $order->update_meta_data('_mft_azul_method_received', 0);
         $order->save();
-        return [
-            'status' => 'method',
-            'methodForm' => (string) ($res['ThreeDSMethod']['MethodForm'] ?? ''),
-        ];
+        return ['status' => 'method', 'methodForm' => $form];
     }
 
     if ($iso === '3D') {
+        $url = (string) ($res['ThreeDSChallenge']['RedirectPostUrl'] ?? '');
+        $creq = (string) ($res['ThreeDSChallenge']['CReq'] ?? '');
+        if (!wp_http_validate_url($url) || wp_parse_url($url, PHP_URL_SCHEME) !== 'https' || $creq === '') {
+            $order->update_meta_data('_mft_azul_3ds_state', 'declined');
+            $order->save();
+            $order->add_order_note('AZUL API: desafío 3DS sin URL o CReq válidos. ' . mft_azul_api_detail($res));
+            return ['status' => 'declined', 'message' => MFT_AZUL_API_MSG['auth']];
+        }
         $order->update_meta_data('_mft_azul_3ds_state', 'challenge');
         $order->save();
         return [
             'status' => 'challenge',
-            'redirectPostUrl' => (string) ($res['ThreeDSChallenge']['RedirectPostUrl'] ?? ''),
-            'creq' => (string) ($res['ThreeDSChallenge']['CReq'] ?? ''),
+            'redirectPostUrl' => $url,
+            'creq' => $creq,
             'termUrl' => mft_azul_api_term_url($order),
         ];
     }
@@ -734,13 +927,8 @@ function mft_azul_api_handle_result($order, $res)
     // Declinada o error de validación. La orden sigue `pending` para reintentar.
     $order->update_meta_data('_mft_azul_3ds_state', 'declined');
     $order->save();
-    $order->add_order_note(sprintf(
-        'AZUL API declinado. ResponseCode: %s · IsoCode: %s · %s %s',
-        $res['ResponseCode'] ?? '',
-        $iso,
-        $res['ResponseMessage'] ?? '',
-        $res['ErrorDescription'] ?? ''
-    ));
+    $order->add_order_note('AZUL API declinado. ' . mft_azul_api_detail($res));
+    mft_azul_api_count_decline();
     return [
         'status' => 'declined',
         'isoCode' => $iso,
@@ -757,7 +945,7 @@ function mft_azul_api_attempt_ref($order, $attempt)
 {
     $ref = $order->get_id() . '-' . $attempt;
     $gw = mft_azul_api_gateway();
-    if ($gw && $gw->get_option('environment') !== 'prod') {
+    if ($gw && $gw->is_test()) {
         $prefix = (string) get_option('mft_azul_test_prefix');
         if ($prefix === '') {
             $prefix = 'T' . strtoupper(substr(bin2hex(random_bytes(3)), 0, 5));
@@ -789,17 +977,26 @@ function mft_azul_api_method_notification_url($order)
     return add_query_arg(['order' => $order->get_id(), 'sid' => mft_azul_api_sid($order)], rest_url('mft/v1/azul-api/method-notify'));
 }
 
-/** Orden a partir de order_id + order_key (lo que tiene la página de pago). */
+/**
+ * Orden a partir de order_id + order_key (lo que tiene la página de pago).
+ * En Pruebas, además, la orden tiene que haber pasado por el checkout con el
+ * método disponible (un administrador o probador): así nadie paga con tarjetas
+ * de prueba una orden ajena aunque tenga su enlace.
+ */
 function mft_azul_api_order_from_request(WP_REST_Request $request)
 {
-    $order_id = absint($request->get_param('order_id'));
+    $order_id = (int) $request->get_param('order_id');
     $key = (string) $request->get_param('order_key');
-    $order = $order_id ? wc_get_order($order_id) : false;
-    if (!$order || $key === '' || !hash_equals($order->get_order_key(), $key)) {
-        return new WP_Error('mft_azul_order', 'Orden no válida.', ['status' => 404]);
+    $order = $order_id > 0 ? wc_get_order($order_id) : false;
+    if (!$order || $order instanceof WC_Order_Refund || $key === '' || !hash_equals($order->get_order_key(), $key)) {
+        return new WP_Error('mft_azul_order', MFT_AZUL_API_MSG['order'], ['status' => 404]);
     }
     if ($order->get_payment_method() !== MFT_AZUL_API_ID) {
-        return new WP_Error('mft_azul_order', 'La orden no usa pago con tarjeta.', ['status' => 400]);
+        return new WP_Error('mft_azul_order', 'Esta orden no usa pago con tarjeta. Vuelve a la página de pago y elige el método.', ['status' => 400]);
+    }
+    $gw = mft_azul_api_gateway();
+    if ($gw && $gw->is_test() && $order->get_meta('_mft_azul_allowed') !== 'test') {
+        return new WP_Error('mft_azul_order', MFT_AZUL_API_MSG['unavailable'], ['status' => 403]);
     }
     return $order;
 }
@@ -807,26 +1004,88 @@ function mft_azul_api_order_from_request(WP_REST_Request $request)
 /** Orden a partir de order + sid (callbacks del ACS, que no conocen la order_key). */
 function mft_azul_api_order_from_sid(WP_REST_Request $request)
 {
-    $order_id = absint($request->get_param('order'));
+    $order_id = (int) $request->get_param('order');
     $sid = (string) $request->get_param('sid');
-    $order = $order_id ? wc_get_order($order_id) : false;
-    if (!$order || $sid === '' || !hash_equals((string) $order->get_meta('_mft_azul_sid'), $sid)) {
+    $order = $order_id > 0 ? wc_get_order($order_id) : false;
+    if (!$order || $order instanceof WC_Order_Refund || $sid === '' || !hash_equals((string) $order->get_meta('_mft_azul_sid'), $sid)) {
         return null;
     }
     return $order;
 }
 
-/** Límite simple por IP contra pruebas masivas de tarjetas (card testing). */
+function mft_azul_api_public_ip($ip)
+{
+    return (bool) filter_var(trim((string) $ip), FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE);
+}
+
+/**
+ * IPs del cliente para el límite de intentos (se cuentan todas).
+ *  - REMOTE_ADDR pública: es la conexión real y no se puede falsear.
+ *  - REMOTE_ADDR privada: es nuestro proxy (Varnish/nginx) y la comparten todos
+ *    los clientes; se usa el último salto público de X-Forwarded-For, que lo
+ *    agrega nuestro proxy (los anteriores los puede inventar el cliente).
+ *  - La de WC_Geolocation (cabeceras falseables) se suma: falsearla solo agrega
+ *    contadores, nunca evita los anteriores.
+ */
+function mft_azul_api_client_ips()
+{
+    $ips = [];
+    $remote = trim((string) ($_SERVER['REMOTE_ADDR'] ?? ''));
+    if (mft_azul_api_public_ip($remote)) {
+        $ips[] = $remote;
+    } else {
+        $chain = array_reverse(array_map('trim', explode(',', (string) ($_SERVER['HTTP_X_FORWARDED_FOR'] ?? ''))));
+        foreach ($chain as $hop) {
+            if (mft_azul_api_public_ip($hop)) {
+                $ips[] = $hop;
+                break;
+            }
+        }
+        if (!$ips && $remote !== '') {
+            $ips[] = $remote;
+        }
+    }
+    if (class_exists('WC_Geolocation')) {
+        $ips[] = (string) WC_Geolocation::get_ip_address();
+    }
+    return array_values(array_unique(array_filter($ips)));
+}
+
+/** Límite por IP contra pruebas masivas de tarjetas (card testing). */
 function mft_azul_api_rate_limited()
 {
-    $ip = class_exists('WC_Geolocation') ? WC_Geolocation::get_ip_address() : ($_SERVER['REMOTE_ADDR'] ?? '');
-    $key = 'mft_azul_rl_' . md5((string) $ip);
-    $count = (int) get_transient($key);
-    if ($count >= (int) apply_filters('mft_azul_api_ip_limit', 15)) {
+    $limit = (int) apply_filters('mft_azul_api_ip_limit', 15);
+    $keys = [];
+    foreach (mft_azul_api_client_ips() as $ip) {
+        $key = 'mft_azul_rl_' . md5($ip);
+        if ((int) get_transient($key) >= $limit) {
+            return true;
+        }
+        $keys[] = $key;
+    }
+    if (mft_azul_api_breaker_open()) {
         return true;
     }
-    set_transient($key, $count + 1, HOUR_IN_SECONDS);
+    foreach ($keys as $key) {
+        set_transient($key, (int) get_transient($key) + 1, HOUR_IN_SECONDS);
+    }
     return false;
+}
+
+/**
+ * Freno global: muchas tarjetas rechazadas en una hora en todo el sitio es la
+ * señal típica de card testing desde muchas IPs. Se pausa el método un rato.
+ */
+function mft_azul_api_count_decline()
+{
+    $key = 'mft_azul_declines_' . gmdate('YmdH');
+    set_transient($key, (int) get_transient($key) + 1, 2 * HOUR_IN_SECONDS);
+}
+
+function mft_azul_api_breaker_open()
+{
+    $limit = (int) apply_filters('mft_azul_api_decline_limit', 40);
+    return (int) get_transient('mft_azul_declines_' . gmdate('YmdH')) >= $limit;
 }
 
 function mft_azul_api_luhn($number)
@@ -852,6 +1111,7 @@ function mft_azul_api_cardholder_info($order, $name)
 {
     $country = $order->get_billing_country();
     $state = $order->get_billing_state();
+    $states = $country ? (array) WC()->countries->get_states($country) : [];
     $fields = [
         'Name' => $name,
         'Email' => $order->get_billing_email(),
@@ -859,16 +1119,14 @@ function mft_azul_api_cardholder_info($order, $name)
         'BillingAddressLine1' => $order->get_billing_address_1(),
         'BillingAddressLine2' => $order->get_billing_address_2(),
         'BillingAddressCity' => $order->get_billing_city(),
-        'BillingAddressState' => ($country && $state && isset(WC()->countries->get_states($country)[$state]))
-            ? WC()->countries->get_states($country)[$state]
-            : $state,
+        'BillingAddressState' => $states[$state] ?? $state,
         'BillingAddressCountry' => $country,
         'BillingAddressZip' => $order->get_billing_postcode(),
     ];
     $limits = ['Email' => 254, 'PhoneMobile' => 32, 'BillingAddressZip' => 24, 'BillingAddressCountry' => 2];
     $out = [];
     foreach ($fields as $k => $v) {
-        $v = trim((string) $v);
+        $v = trim(wp_strip_all_tags((string) $v));
         if ($v === '') {
             continue;
         }
@@ -885,22 +1143,38 @@ function mft_azul_api_browser_info(array $b)
     if (stripos($accept, 'text/html') === false) {
         $accept = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8';
     }
-    $ip = class_exists('WC_Geolocation') ? WC_Geolocation::get_ip_address() : ($_SERVER['REMOTE_ADDR'] ?? '');
     $ua = isset($_SERVER['HTTP_USER_AGENT']) ? (string) wp_unslash($_SERVER['HTTP_USER_AGENT']) : '';
-    $int = function ($k, $default) use ($b) {
-        return isset($b[$k]) && is_numeric($b[$k]) ? (string) (int) $b[$k] : $default;
+    $int = function ($k, $default, $min, $max) use ($b) {
+        if (!isset($b[$k]) || !is_numeric($b[$k])) {
+            return $default;
+        }
+        return (string) max($min, min($max, (int) $b[$k]));
     };
+    $lang = isset($b['language']) && is_string($b['language'])
+        ? substr(preg_replace('/[^A-Za-z\-]/', '', $b['language']), 0, 8)
+        : '';
     return [
-        'AcceptHeader' => $accept,
-        'IPAddress' => (string) $ip,
-        'Language' => isset($b['language']) ? substr(preg_replace('/[^A-Za-z\-]/', '', (string) $b['language']), 0, 8) : 'es-DO',
-        'ColorDepth' => $int('colorDepth', '24'),
-        'ScreenWidth' => $int('screenWidth', '1280'),
-        'ScreenHeight' => $int('screenHeight', '800'),
-        'TimeZone' => $int('timeZone', '240'),
+        'AcceptHeader' => substr($accept, 0, 2048),
+        'IPAddress' => (string) (mft_azul_api_client_ips()[0] ?? ''),
+        'Language' => $lang !== '' ? $lang : 'es-DO',
+        'ColorDepth' => $int('colorDepth', '24', 1, 48),
+        'ScreenWidth' => $int('screenWidth', '1280', 1, 99999),
+        'ScreenHeight' => $int('screenHeight', '800', 1, 99999),
+        'TimeZone' => $int('timeZone', '240', -900, 900),
         'UserAgent' => substr($ua, 0, 2048),
         'JavaScriptEnabled' => 'true',
     ];
+}
+
+/** La conexión del cliente es HTTPS (también detrás de Cloudflare/Varnish). */
+function mft_azul_api_is_https()
+{
+    if (is_ssl()) {
+        return true;
+    }
+    $proto = strtolower((string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? ''));
+    $cf = (string) ($_SERVER['HTTP_CF_VISITOR'] ?? '');
+    return $proto === 'https' || str_contains($cf, '"https"');
 }
 
 // ===========================================================================
@@ -908,20 +1182,36 @@ function mft_azul_api_browser_info(array $b)
 // ===========================================================================
 
 add_action('rest_api_init', function () {
+    $order_args = [
+        'order_id' => ['type' => 'integer', 'required' => true, 'minimum' => 1],
+        'order_key' => ['type' => 'string', 'required' => true, 'maxLength' => 64],
+    ];
     register_rest_route('mft/v1', '/azul-api/pay', [
         'methods' => 'POST',
-        'callback' => 'mft_azul_api_rest_pay',
+        'callback' => mft_azul_api_guarded('mft_azul_api_rest_pay'),
         'permission_callback' => '__return_true',
+        'args' => $order_args + [
+            'card' => ['type' => 'object', 'required' => true],
+            'browser' => ['type' => 'object', 'required' => false],
+        ],
     ]);
     register_rest_route('mft/v1', '/azul-api/method-status', [
         'methods' => 'GET',
-        'callback' => 'mft_azul_api_rest_method_status',
+        'callback' => mft_azul_api_guarded('mft_azul_api_rest_method_status'),
         'permission_callback' => '__return_true',
+        'args' => $order_args,
+    ]);
+    register_rest_route('mft/v1', '/azul-api/status', [
+        'methods' => 'GET',
+        'callback' => mft_azul_api_guarded('mft_azul_api_rest_status'),
+        'permission_callback' => '__return_true',
+        'args' => $order_args,
     ]);
     register_rest_route('mft/v1', '/azul-api/continue', [
         'methods' => 'POST',
-        'callback' => 'mft_azul_api_rest_continue',
+        'callback' => mft_azul_api_guarded('mft_azul_api_rest_continue'),
         'permission_callback' => '__return_true',
+        'args' => $order_args,
     ]);
     // Callbacks del ACS del banco emisor (POST de formulario desde el navegador).
     register_rest_route('mft/v1', '/azul-api/method-notify', [
@@ -936,6 +1226,31 @@ add_action('rest_api_init', function () {
     ]);
 });
 
+/**
+ * Envuelve un endpoint JSON: ningún error inesperado llega crudo al cliente.
+ * Si había una llamada a AZUL en curso (`_mft_azul_inflight`), el resultado es
+ * desconocido y se programa VerifyPayment en vez de permitir otro cobro.
+ */
+function mft_azul_api_guarded($callback)
+{
+    return function (WP_REST_Request $request) use ($callback) {
+        @set_time_limit(MFT_AZUL_API_TIMEOUT * 2 + 30);
+        try {
+            return $callback($request);
+        } catch (Throwable $e) {
+            mft_azul_api_log_error($callback, $e);
+            $order_id = (int) $request->get_param('order_id');
+            $order = $order_id > 0 ? mft_azul_api_fresh_order($order_id) : null;
+            if ($order && $order->get_meta('_mft_azul_inflight')) {
+                $order->add_order_note('Error inesperado durante un cobro AZUL (' . $e->getMessage() . '). Se verificará con VerifyPayment.');
+                mft_azul_api_schedule_verify($order, (string) $order->get_meta('_mft_azul_inflight'));
+                return ['status' => 'pending', 'message' => MFT_AZUL_API_MSG['unknown']];
+            }
+            return new WP_Error('mft_azul_error', MFT_AZUL_API_MSG['generic'], ['status' => 500]);
+        }
+    };
+}
+
 // Las respuestas de pago nunca se cachean (Varnish, navegador).
 add_filter('rest_post_dispatch', function ($response, $server, $request) {
     if (str_starts_with((string) $request->get_route(), '/mft/v1/azul-api/')) {
@@ -946,50 +1261,69 @@ add_filter('rest_post_dispatch', function ($response, $server, $request) {
     return $response;
 }, 10, 3);
 
+// Los errores de validación de WordPress (en inglés) se traducen para la página de pago.
+add_filter('rest_request_after_callbacks', function ($response, $handler, $request) {
+    if (is_wp_error($response) && str_starts_with((string) $request->get_route(), '/mft/v1/azul-api/')
+        && !str_starts_with((string) $response->get_error_code(), 'mft_azul')) {
+        $data = (array) $response->get_error_data();
+        return new WP_Error('mft_azul_request', MFT_AZUL_API_MSG['generic'], ['status' => (int) ($data['status'] ?? 400)]);
+    }
+    return $response;
+}, 10, 3);
+
 function mft_azul_api_rest_pay(WP_REST_Request $request)
 {
     $gw = mft_azul_api_gateway();
-    if (!$gw || !$gw->is_configured()) {
-        return new WP_Error('mft_azul_config', 'El pago con tarjeta no está disponible.', ['status' => 503]);
+    if (!$gw || !$gw->is_configured() || $gw->enabled !== 'yes') {
+        return new WP_Error('mft_azul_config', MFT_AZUL_API_MSG['unavailable'], ['status' => 503]);
     }
-    if ($gw->get_option('environment') === 'prod' && !is_ssl()) {
-        return new WP_Error('mft_azul_ssl', 'Conexión no segura.', ['status' => 400]);
+    if (!$gw->is_test() && !mft_azul_api_is_https()) {
+        return new WP_Error('mft_azul_ssl', 'La conexión no es segura. Abre la página de pago con https://.', ['status' => 400]);
     }
     $order = mft_azul_api_order_from_request($request);
     if (is_wp_error($order)) {
         return $order;
     }
-    if ($order->is_paid()) {
+    if ($order->get_currency() !== MFT_AZUL_API_CURRENCY) {
+        return new WP_Error('mft_azul_currency', MFT_AZUL_API_MSG['unavailable'], ['status' => 400]);
+    }
+    if (mft_azul_api_is_charged($order)) {
         return ['status' => 'approved', 'redirect' => mft_azul_api_approved_redirect($order)];
     }
     if (!$order->needs_payment()) {
-        return new WP_Error('mft_azul_order', 'La orden ya no admite pagos.', ['status' => 409]);
+        return new WP_Error('mft_azul_order', MFT_AZUL_API_MSG['expired'], ['status' => 409]);
     }
 
     // Un intento anterior quedó sin respuesta: primero se verifica, nunca se cobra a ciegas.
     if ($order->get_meta('_mft_azul_pending_verify')) {
         mft_azul_api_verify_order($order->get_id(), 99);
-        $order = wc_get_order($order->get_id());
-        if ($order->is_paid()) {
+        $order = mft_azul_api_fresh_order($order->get_id());
+        if (mft_azul_api_is_charged($order)) {
             return ['status' => 'approved', 'redirect' => mft_azul_api_approved_redirect($order)];
         }
         if ($order->get_meta('_mft_azul_pending_verify')) {
-            return ['status' => 'pending', 'message' => 'Estamos confirmando un intento de pago anterior. Intenta de nuevo en unos minutos.'];
+            return ['status' => 'pending', 'message' => MFT_AZUL_API_MSG['verifying']];
         }
     }
 
     // Tarjeta (solo en memoria; nunca se persiste).
     $card = (array) $request->get_param('card');
-    $number = preg_replace('/\D/', '', (string) ($card['number'] ?? ''));
-    $cvc = preg_replace('/\D/', '', (string) ($card['cvc'] ?? ''));
-    $month = (int) ($card['expMonth'] ?? 0);
-    $year = (int) ($card['expYear'] ?? 0);
+    $scalar = function ($k) use ($card) {
+        return isset($card[$k]) && is_scalar($card[$k]) ? (string) $card[$k] : '';
+    };
+    $number = preg_replace('/\D/', '', $scalar('number'));
+    $cvc = preg_replace('/\D/', '', $scalar('cvc'));
+    $month = (int) $scalar('expMonth');
+    $year = (int) $scalar('expYear');
     if ($year > 0 && $year < 100) {
         $year += 2000;
     }
-    $name = trim(sanitize_text_field((string) ($card['name'] ?? '')));
-    $exp_ts = $year ? mktime(0, 0, 0, $month + 1, 1, $year) : 0;
+    $name = trim(sanitize_text_field($scalar('name')));
+    $exp_ts = ($year >= 2000 && $year <= 2100) ? mktime(0, 0, 0, $month + 1, 1, $year) : 0;
 
+    if ($name === '' || mb_strlen($name) > 60) {
+        return ['status' => 'invalid', 'field' => 'name', 'message' => 'Escribe el nombre como aparece en la tarjeta.'];
+    }
     if (strlen($number) < 13 || strlen($number) > 19 || !mft_azul_api_luhn($number)) {
         return ['status' => 'invalid', 'field' => 'number', 'message' => 'El número de tarjeta no es válido.'];
     }
@@ -999,23 +1333,33 @@ function mft_azul_api_rest_pay(WP_REST_Request $request)
     if (strlen($cvc) < 3 || strlen($cvc) > 4) {
         return ['status' => 'invalid', 'field' => 'cvc', 'message' => 'El código de seguridad no es válido.'];
     }
-    if ($name === '') {
-        return ['status' => 'invalid', 'field' => 'name', 'message' => 'Escribe el nombre como aparece en la tarjeta.'];
-    }
 
     if (mft_azul_api_rate_limited()) {
-        return new WP_Error('mft_azul_rate', 'Demasiados intentos. Intenta más tarde.', ['status' => 429]);
+        return new WP_Error('mft_azul_rate', MFT_AZUL_API_MSG['rate'], ['status' => 429]);
     }
-    $attempts = (int) $order->get_meta('_mft_azul_attempts');
     $max = max(1, (int) $gw->get_option('max_attempts', 5));
-    if ($attempts >= $max) {
-        return new WP_Error('mft_azul_attempts', 'Se alcanzó el máximo de intentos para esta orden. Contáctanos para completar tu compra.', ['status' => 429]);
+    if ((int) $order->get_meta('_mft_azul_attempts') >= $max) {
+        return new WP_Error('mft_azul_attempts', MFT_AZUL_API_MSG['attempts'], ['status' => 429]);
     }
     if (!mft_azul_api_lock($order->get_id())) {
-        return new WP_Error('mft_azul_busy', 'Ya hay un pago en proceso para esta orden.', ['status' => 409]);
+        return new WP_Error('mft_azul_busy', MFT_AZUL_API_MSG['busy'], ['status' => 409]);
     }
 
     try {
+        // Con el candado, se vuelve a leer la orden: otra petición pudo cobrarla
+        // entre la primera lectura y este punto.
+        $order = mft_azul_api_fresh_order($order->get_id());
+        if (mft_azul_api_is_charged($order)) {
+            return ['status' => 'approved', 'redirect' => mft_azul_api_approved_redirect($order)];
+        }
+        if (!$order->needs_payment() || $order->get_meta('_mft_azul_pending_verify')) {
+            return ['status' => 'pending', 'message' => MFT_AZUL_API_MSG['verifying']];
+        }
+        $attempts = (int) $order->get_meta('_mft_azul_attempts');
+        if ($attempts >= $max) {
+            return new WP_Error('mft_azul_attempts', MFT_AZUL_API_MSG['attempts'], ['status' => 429]);
+        }
+
         // AZUL a veces responde "SGS-005003: The order already exists" con un
         // número nuevo (visto en pruebas). Es un rechazo sin cobro: se reintenta
         // una vez con otro número de intento.
@@ -1047,6 +1391,7 @@ function mft_azul_api_sale($gw, $order, $attempts, WP_REST_Request $request, $nu
     $order->update_meta_data('_mft_azul_custom_order_id', $custom_order_id);
     $order->update_meta_data('_mft_azul_card_last4', substr($number, -4));
     $order->update_meta_data('_mft_azul_3ds_state', 'sale');
+    $order->update_meta_data('_mft_azul_inflight', $custom_order_id);
     $order->save();
 
     $cents = mft_azul_api_cents($order->get_total());
@@ -1095,19 +1440,45 @@ function mft_azul_api_rest_method_status(WP_REST_Request $request)
     return ['received' => (bool) $order->get_meta('_mft_azul_method_received')];
 }
 
+/**
+ * Estado de la orden para la página de pago cuando no supo el resultado (corte
+ * de red, timeout de Cloudflare…).
+ */
+function mft_azul_api_rest_status(WP_REST_Request $request)
+{
+    $order = mft_azul_api_order_from_request($request);
+    if (is_wp_error($order)) {
+        return $order;
+    }
+    $order = mft_azul_api_fresh_order($order->get_id());
+    if (mft_azul_api_is_charged($order)) {
+        return ['status' => 'approved', 'redirect' => mft_azul_api_approved_redirect($order)];
+    }
+    if ($order->get_meta('_mft_azul_inflight') || $order->get_meta('_mft_azul_pending_verify')) {
+        return ['status' => 'processing'];
+    }
+    return ['status' => 'open'];
+}
+
 /** El ACS del emisor confirma (dentro del iframe oculto) que recibió los datos del navegador. */
 function mft_azul_api_rest_method_notify(WP_REST_Request $request)
 {
-    $order = mft_azul_api_order_from_sid($request);
-    if ($order) {
-        $data = json_decode((string) base64_decode((string) $request->get_param('threeDSMethodData'), true), true);
-        $order->update_meta_data('_mft_azul_method_received', 1);
-        if (!empty($data['threeDSServerTransID'])) {
-            $order->update_meta_data('_mft_azul_3ds_server_trans_id', sanitize_text_field((string) $data['threeDSServerTransID']));
+    try {
+        $order = mft_azul_api_order_from_sid($request);
+        if ($order && $order->get_meta('_mft_azul_3ds_state') === 'method') {
+            $raw = $request->get_param('threeDSMethodData');
+            $data = is_string($raw) ? json_decode((string) base64_decode($raw, true), true) : null;
+            $order->update_meta_data('_mft_azul_method_received', 1);
+            if (is_array($data) && !empty($data['threeDSServerTransID']) && is_string($data['threeDSServerTransID'])) {
+                $order->update_meta_data('_mft_azul_3ds_server_trans_id', substr(sanitize_text_field($data['threeDSServerTransID']), 0, 64));
+            }
+            $order->save();
         }
-        $order->save();
+    } catch (Throwable $e) {
+        mft_azul_api_log_error('method-notify', $e);
     }
     // Se renderiza dentro del iframe oculto: basta una página vacía.
+    nocache_headers();
     header('Content-Type: text/html; charset=utf-8');
     echo '<!doctype html><title>ok</title>';
     exit;
@@ -1117,20 +1488,35 @@ function mft_azul_api_rest_method_notify(WP_REST_Request $request)
 function mft_azul_api_rest_continue(WP_REST_Request $request)
 {
     $gw = mft_azul_api_gateway();
+    if (!$gw || !$gw->is_configured()) {
+        return new WP_Error('mft_azul_config', MFT_AZUL_API_MSG['unavailable'], ['status' => 503]);
+    }
     $order = mft_azul_api_order_from_request($request);
     if (is_wp_error($order)) {
         return $order;
     }
-    if ($order->is_paid()) {
+    if (mft_azul_api_is_charged($order)) {
         return ['status' => 'approved', 'redirect' => mft_azul_api_approved_redirect($order)];
     }
-    if ($order->get_meta('_mft_azul_3ds_state') !== 'method') {
-        return new WP_Error('mft_azul_state', 'El pago no está esperando la verificación del banco.', ['status' => 409]);
-    }
     if (!mft_azul_api_lock($order->get_id())) {
-        return new WP_Error('mft_azul_busy', 'Ya hay un pago en proceso para esta orden.', ['status' => 409]);
+        return new WP_Error('mft_azul_busy', MFT_AZUL_API_MSG['busy'], ['status' => 409]);
     }
     try {
+        $order = mft_azul_api_fresh_order($order->get_id());
+        if (mft_azul_api_is_charged($order)) {
+            return ['status' => 'approved', 'redirect' => mft_azul_api_approved_redirect($order)];
+        }
+        if ($order->get_meta('_mft_azul_3ds_state') !== 'method') {
+            return ['status' => 'error', 'message' => 'El pago no está esperando la verificación del banco. Intenta de nuevo.'];
+        }
+        // La orden expiró (reserva de stock) mientras se verificaba: no se completa el cobro.
+        if (!$order->needs_payment()) {
+            $order->update_meta_data('_mft_azul_3ds_state', 'expired');
+            $order->save();
+            return ['status' => 'error', 'message' => MFT_AZUL_API_MSG['expired']];
+        }
+        $order->update_meta_data('_mft_azul_inflight', (string) $order->get_meta('_mft_azul_custom_order_id'));
+        $order->save();
         $res = mft_azul_api_call('processthreedsmethod', [
             'Channel' => $gw->get_option('channel'),
             'Store' => $gw->get_option('store'),
@@ -1146,29 +1532,85 @@ function mft_azul_api_rest_continue(WP_REST_Request $request)
 /** TermUrl: el ACS devuelve al cliente aquí (POST con cRes) tras el desafío. */
 function mft_azul_api_rest_term(WP_REST_Request $request)
 {
-    $order = mft_azul_api_order_from_sid($request);
-    if (!$order) {
-        wp_safe_redirect(home_url('/'));
-        exit;
+    @set_time_limit(MFT_AZUL_API_TIMEOUT * 2 + 30);
+    nocache_headers();
+    $order = null;
+    try {
+        $order = mft_azul_api_order_from_sid($request);
+        if (!$order) {
+            wp_safe_redirect(home_url('/'));
+            exit;
+        }
+        $redirect = mft_azul_api_term_process($order, $request);
+    } catch (Throwable $e) {
+        mft_azul_api_log_error('term', $e);
+        $redirect = home_url('/');
+        if ($order) {
+            $order = mft_azul_api_fresh_order($order->get_id());
+            if ($order->get_meta('_mft_azul_inflight')) {
+                $order->add_order_note('Error inesperado al completar el 3D Secure (' . $e->getMessage() . '). Se verificará con VerifyPayment.');
+                mft_azul_api_schedule_verify($order, (string) $order->get_meta('_mft_azul_inflight'));
+                $redirect = mft_azul_api_retry_redirect($order, MFT_AZUL_API_MSG['unknown']);
+            } else {
+                $redirect = mft_azul_api_retry_redirect($order, MFT_AZUL_API_MSG['generic']);
+            }
+        }
     }
-    if ($order->is_paid()) {
-        wp_safe_redirect(mft_azul_api_approved_redirect($order));
-        exit;
+    wp_safe_redirect($redirect);
+    exit;
+}
+
+/** Completa el desafío 3DS y devuelve a dónde mandar al cliente. */
+function mft_azul_api_term_process($order, WP_REST_Request $request)
+{
+    if (mft_azul_api_is_charged($order)) {
+        return mft_azul_api_approved_redirect($order);
     }
     $cres = '';
     foreach (['cRes', 'CRes', 'cres'] as $k) {
-        if ($request->get_param($k)) {
-            $cres = (string) $request->get_param($k);
+        $v = $request->get_param($k);
+        if (is_string($v) && $v !== '') {
+            $cres = $v;
             break;
         }
     }
-    if ($cres === '' || $order->get_meta('_mft_azul_3ds_state') !== 'challenge' || !mft_azul_api_lock($order->get_id())) {
-        wp_safe_redirect(mft_azul_api_retry_redirect($order, 'No se completó la autenticación con tu banco. Intenta de nuevo.'));
-        exit;
+    if ($cres === '' || strlen($cres) > 20000 || $order->get_meta('_mft_azul_3ds_state') !== 'challenge') {
+        return mft_azul_api_retry_redirect($order, MFT_AZUL_API_MSG['auth']);
     }
 
-    $gw = mft_azul_api_gateway();
+    // El ACS a veces envía el formulario dos veces: la segunda espera a la primera.
+    $locked = false;
+    for ($i = 0; $i < 20 && !($locked = mft_azul_api_lock($order->get_id())); $i++) {
+        usleep(500000);
+        $order = mft_azul_api_fresh_order($order->get_id());
+        if (mft_azul_api_is_charged($order)) {
+            return mft_azul_api_approved_redirect($order);
+        }
+    }
+    if (!$locked) {
+        return mft_azul_api_retry_redirect($order, MFT_AZUL_API_MSG['verifying']);
+    }
+
     try {
+        $order = mft_azul_api_fresh_order($order->get_id());
+        if (mft_azul_api_is_charged($order)) {
+            return mft_azul_api_approved_redirect($order);
+        }
+        if ($order->get_meta('_mft_azul_3ds_state') !== 'challenge') {
+            return mft_azul_api_retry_redirect($order, MFT_AZUL_API_MSG['auth']);
+        }
+        // La orden expiró (reserva de stock) mientras el cliente estaba en el banco:
+        // no se completa el cobro.
+        if (!$order->needs_payment()) {
+            $order->update_meta_data('_mft_azul_3ds_state', 'expired');
+            $order->save();
+            $order->add_order_note('AZUL API: el cliente terminó el 3D Secure con la orden ya ' . $order->get_status() . '; no se completó el cobro.');
+            return mft_azul_api_retry_redirect($order, MFT_AZUL_API_MSG['expired']);
+        }
+
+        $gw = mft_azul_api_gateway();
+        $order->update_meta_data('_mft_azul_inflight', (string) $order->get_meta('_mft_azul_custom_order_id'));
+        $order->save();
         $res = mft_azul_api_call('processthreedschallenge', [
             'Channel' => $gw->get_option('channel'),
             'Store' => $gw->get_option('store'),
@@ -1182,10 +1624,10 @@ function mft_azul_api_rest_term(WP_REST_Request $request)
 
     // Resultado desconocido ('pending') NO es un rechazo: /pay bloquea nuevos
     // cobros hasta que VerifyPayment lo resuelva.
-    wp_safe_redirect($result['status'] === 'approved'
-        ? $result['redirect']
-        : mft_azul_api_retry_redirect($order, $result['message'] ?? 'No se pudo completar el pago.'));
-    exit;
+    if ($result['status'] === 'approved') {
+        return $result['redirect'];
+    }
+    return mft_azul_api_retry_redirect($order, $result['message'] ?? MFT_AZUL_API_MSG['generic']);
 }
 
 // ===========================================================================
@@ -1196,44 +1638,65 @@ add_action('mft_azul_api_verify', 'mft_azul_api_verify_order', 10, 2);
 
 function mft_azul_api_verify_order($order_id, $tries = 0)
 {
-    $order = wc_get_order($order_id);
+    try {
+        mft_azul_api_verify_run((int) $order_id, (int) $tries);
+    } catch (Throwable $e) {
+        mft_azul_api_log_error('verify', $e);
+    }
+}
+
+function mft_azul_api_verify_run($order_id, $tries)
+{
     $gw = mft_azul_api_gateway();
-    if (!$order || !$gw) {
-        return;
-    }
-    $custom = (string) $order->get_meta('_mft_azul_pending_verify');
-    if ($custom === '' || $order->is_paid()) {
-        return;
-    }
-
-    $res = mft_azul_api_call('VerifyPayment', [
-        'Channel' => $gw->get_option('channel'),
-        'Store' => $gw->get_option('store'),
-        'CustomOrderId' => $custom,
-    ]);
-
-    if (is_wp_error($res) || ($res['ResponseCode'] ?? '') === 'Error') {
-        // Llamada manual desde /pay (tries=99): no reprogramar, ya hay un evento.
-        if ($tries < 3) {
-            wp_schedule_single_event(time() + 10 * MINUTE_IN_SECONDS, 'mft_azul_api_verify', [$order_id, $tries + 1]);
-        } elseif ($tries !== 99) {
-            $order->add_order_note('VerifyPayment AZUL sin respuesta tras varios intentos (' . $custom . '). Revisar manualmente en el portal de AZUL.');
+    if (!$gw || !mft_azul_api_lock($order_id)) {
+        // Hay otra operación en curso: se reintenta más tarde.
+        if ($gw && $tries !== 99) {
+            wp_schedule_single_event(time() + 2 * MINUTE_IN_SECONDS, 'mft_azul_api_verify', [$order_id, $tries + 1]);
         }
         return;
     }
+    try {
+        $order = mft_azul_api_fresh_order($order_id);
+        if (!$order) {
+            return;
+        }
+        $custom = (string) $order->get_meta('_mft_azul_pending_verify');
+        if ($custom === '' || mft_azul_api_is_charged($order)) {
+            return;
+        }
 
-    $found = filter_var($res['Found'] ?? false, FILTER_VALIDATE_BOOLEAN);
-    if ($found && ($res['IsoCode'] ?? '') === '00') {
-        $order->add_order_note('VerifyPayment AZUL: el intento ' . $custom . ' fue APROBADO.');
-        mft_azul_api_mark_paid($order, $res);
-        return;
+        $res = mft_azul_api_call('VerifyPayment', [
+            'Channel' => $gw->get_option('channel'),
+            'Store' => $gw->get_option('store'),
+            'CustomOrderId' => $custom,
+        ]);
+
+        if (is_wp_error($res) || ($res['ResponseCode'] ?? '') === 'Error') {
+            // Llamada manual desde /pay (tries=99): no reprogramar, ya hay un evento.
+            if ($tries < 3) {
+                wp_schedule_single_event(time() + 10 * MINUTE_IN_SECONDS, 'mft_azul_api_verify', [$order_id, $tries + 1]);
+            } elseif ($tries !== 99) {
+                $order->add_order_note('VerifyPayment AZUL sin respuesta tras varios intentos (' . $custom . '). Revisar manualmente en el portal de AZUL.');
+            }
+            return;
+        }
+
+        $found = filter_var($res['Found'] ?? false, FILTER_VALIDATE_BOOLEAN);
+        if ($found && ($res['IsoCode'] ?? '') === '00') {
+            $order->add_order_note('VerifyPayment AZUL: el intento ' . $custom . ' fue APROBADO.');
+            mft_azul_api_mark_paid($order, $res);
+            return;
+        }
+
+        $order->delete_meta_data('_mft_azul_pending_verify');
+        $order->update_meta_data('_mft_azul_3ds_state', 'declined');
+        $order->save();
+        $order->add_order_note(sprintf(
+            'VerifyPayment AZUL: el intento %s %s.',
+            $custom,
+            $found ? 'no se completó (IsoCode ' . ($res['IsoCode'] ?? '') . ')' : 'no se encontró (no hubo cobro)'
+        ));
+    } finally {
+        mft_azul_api_unlock($order_id);
     }
-
-    $order->delete_meta_data('_mft_azul_pending_verify');
-    $order->save();
-    $order->add_order_note(sprintf(
-        'VerifyPayment AZUL: el intento %s %s.',
-        $custom,
-        $found ? 'no se completó (IsoCode ' . ($res['IsoCode'] ?? '') . ')' : 'no se encontró (no hubo cobro)'
-    ));
 }

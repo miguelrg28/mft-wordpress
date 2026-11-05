@@ -7,6 +7,8 @@
  * 3. Si hay desafío (3D), navega al ACS del banco con un POST (creq); el banco
  *    vuelve al TermUrl, que completa el cobro y redirige.
  *
+ * Si no se sabe el resultado (corte de red, timeout, respuesta rara) nunca se
+ * invita a pagar de nuevo: se consulta /status hasta saber si la orden se pagó.
  * Los datos de tarjeta solo viven en memoria durante la llamada a /pay.
  */
 (function () {
@@ -15,6 +17,7 @@
   var cfg = window.mftAzul;
   var root = document.getElementById('mft-azul');
   if (!cfg || !root) return;
+  var msg = cfg.msg || {};
 
   var inputs = {};
   root.querySelectorAll('[data-field]').forEach(function (el) {
@@ -25,6 +28,8 @@
   var overlay = root.querySelector('.mft-azul__overlay');
   var stageEl = root.querySelector('.mft-azul__stage');
   var payBtn = root.querySelector('.mft-azul__pay');
+  var busy = false;
+  var leaving = false;
 
   function digits(v) {
     return String(v || '').replace(/\D/g, '');
@@ -48,6 +53,11 @@
   });
   inputs.cvc.addEventListener('input', function () {
     this.value = digits(this.value).slice(0, 4);
+  });
+  Object.keys(inputs).forEach(function (k) {
+    inputs[k].addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') payBtn.click();
+    });
   });
 
   function luhn(n) {
@@ -75,7 +85,8 @@
 
   // Validación local (el plugin vuelve a validar todo).
   function validate() {
-    if (!inputs.name.value.trim()) return { field: 'name', message: 'Escribe el nombre como aparece en la tarjeta.' };
+    var name = inputs.name.value.trim();
+    if (!name || name.length > 60) return { field: 'name', message: 'Escribe el nombre como aparece en la tarjeta.' };
     var n = digits(inputs.number.value);
     if (n.length < 13 || n.length > 19 || !luhn(n)) return { field: 'number', message: 'El número de tarjeta no es válido.' };
     var exp = parseExp(inputs.exp.value);
@@ -91,6 +102,7 @@
   function showError(err) {
     Object.keys(inputs).forEach(function (k) {
       inputs[k].classList.toggle('is-invalid', !!err && err.field === k);
+      inputs[k].setAttribute('aria-invalid', err && err.field === k ? 'true' : 'false');
     });
     errorEl.hidden = !err;
     errorEl.textContent = err ? err.message : '';
@@ -100,31 +112,77 @@
   function showNotice(message) {
     noticeEl.hidden = !message;
     noticeEl.textContent = message || '';
+    if (message) noticeEl.scrollIntoView({ block: 'center', behavior: 'smooth' });
   }
 
   function setBusy(stage) {
-    var busy = !!stage;
+    busy = !!stage;
     root.setAttribute('data-busy', busy ? '1' : '0');
     overlay.hidden = !busy;
     payBtn.disabled = busy;
     Object.keys(inputs).forEach(function (k) {
       inputs[k].disabled = busy;
     });
-    if (busy) stageEl.textContent = stage === 'authenticating' ? 'Verificando con tu banco...' : 'Procesando tu pago...';
+    if (busy) {
+      stageEl.textContent = stage === 'authenticating'
+        ? 'Verificando con tu banco...'
+        : stage === 'checking' ? (msg.checking || 'Confirmando tu pago...') : 'Procesando tu pago...';
+    }
   }
 
-  function post(path, body) {
-    return fetch(cfg.api + path, {
-      method: 'POST',
+  function go(url) {
+    leaving = true;
+    window.location.assign(url);
+  }
+
+  // Avisa antes de salir mientras el pago está en curso.
+  window.addEventListener('beforeunload', function (e) {
+    if (busy && !leaving) {
+      e.preventDefault();
+      e.returnValue = msg.leave || '';
+    }
+  });
+
+  /**
+   * Error de la API. `known` = el servidor respondió con uno de nuestros
+   * mensajes (códigos mft_azul_*); si no, el resultado puede ser desconocido.
+   */
+  function ApiError(message, known, status) {
+    this.message = message;
+    this.known = known;
+    this.status = status || 0;
+  }
+
+  function request(method, path, body) {
+    var url = cfg.api + path;
+    var opts = {
+      method: method,
       credentials: 'same-origin',
-      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }).then(function (res) {
-      return res.json().catch(function () { return {}; }).then(function (data) {
-        if (!res.ok) throw new Error((data && data.message) || 'Error ' + res.status);
-        return data;
-      });
-    });
+      cache: 'no-store',
+      headers: { Accept: 'application/json' },
+    };
+    if (method === 'GET') {
+      url += (url.indexOf('?') === -1 ? '?' : '&') + 'order_id=' + encodeURIComponent(cfg.orderId) +
+        '&order_key=' + encodeURIComponent(cfg.orderKey) + '&_=' + Date.now();
+    } else {
+      opts.headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(body);
+    }
+    return fetch(url, opts).then(
+      function (res) {
+        return res.text().then(function (text) {
+          var data = null;
+          try { data = JSON.parse(text); } catch (e) { data = null; }
+          var ours = data && typeof data.code === 'string' && data.code.indexOf('mft_azul') === 0;
+          if (!res.ok) throw new ApiError(ours ? data.message : (msg.generic || ''), ours, res.status);
+          if (!data || typeof data.status !== 'string') throw new ApiError(msg.generic || '', false, res.status);
+          return data;
+        });
+      },
+      function () {
+        throw new ApiError(msg.connect || '', false, 0);
+      }
+    );
   }
 
   // Datos del navegador que pide 3D Secure 2.0 (doc AZUL 3DS, "BrowserInfo").
@@ -147,10 +205,12 @@
     var box = document.createElement('div');
     box.setAttribute('aria-hidden', 'true');
     box.style.cssText = 'position:absolute;width:1px;height:1px;overflow:hidden;left:-9999px;top:0';
-    box.innerHTML = html;
+    box.innerHTML = String(html || '');
     document.body.appendChild(box);
     var form = box.querySelector('form');
-    if (form) form.submit();
+    if (form) {
+      try { form.submit(); } catch (e) { /* se sigue sin la notificación del emisor */ }
+    }
     return function () { box.remove(); };
   }
 
@@ -161,16 +221,42 @@
   // Espera la notificación del ACS (hasta 10 s, según el doc) consultando al plugin.
   function waitMethodNotification() {
     var deadline = Date.now() + 10000;
-    var qs = '?order_id=' + encodeURIComponent(cfg.orderId) + '&order_key=' + encodeURIComponent(cfg.orderKey);
     function tick() {
       if (Date.now() >= deadline) return Promise.resolve();
       return sleep(1000)
-        .then(function () {
-          return fetch(cfg.api + '/method-status' + qs + '&_=' + Date.now(), { headers: { Accept: 'application/json' }, cache: 'no-store' });
-        })
-        .then(function (res) { return res.ok ? res.json() : {}; })
+        .then(function () { return request('GET', '/method-status'); })
         .catch(function () { return {}; })
         .then(function (data) { return data && data.received ? null : tick(); });
+    }
+    return tick();
+  }
+
+  /**
+   * Resultado desconocido: consulta el estado de la orden hasta ~90 s. Si se
+   * pagó, se va a "orden recibida"; si no, se explica sin invitar a pagar otra
+   * vez si el servidor sigue procesando.
+   */
+  function checkStatus() {
+    setBusy('checking');
+    var deadline = Date.now() + 90000;
+    function tick() {
+      return request('GET', '/status')
+        .catch(function () { return { status: 'unreachable' }; })
+        .then(function (data) {
+          if (data.status === 'approved') return go(data.redirect);
+          if (data.status === 'open') {
+            setBusy(null);
+            showNotice(msg.generic);
+            return null;
+          }
+          if (Date.now() >= deadline) {
+            setBusy(null);
+            payBtn.disabled = true;
+            showNotice(msg.unknown);
+            return null;
+          }
+          return sleep(4000).then(tick);
+        });
     }
     return tick();
   }
@@ -190,35 +276,50 @@
       form.appendChild(input);
     });
     document.body.appendChild(form);
+    leaving = true;
     form.submit();
   }
 
+  function clearSensitive() {
+    inputs.number.value = '';
+    inputs.cvc.value = '';
+  }
+
   function finish(res) {
-    if (res.status === 'approved') {
-      window.location.assign(res.redirect);
-      return;
-    }
-    if (res.status === 'challenge') {
-      submitChallenge(res.redirectPostUrl, res.creq, res.termUrl);
-      return;
+    if (res.status === 'approved' && res.redirect) return go(res.redirect);
+    if (res.status === 'challenge' && res.redirectPostUrl) {
+      return submitChallenge(res.redirectPostUrl, res.creq, res.termUrl);
     }
     setBusy(null);
     if (res.status === 'invalid') {
       showError({ field: res.field, message: res.message });
-      return;
+      return null;
     }
     // Se limpian los datos sensibles tras cada intento fallido.
-    inputs.number.value = '';
-    inputs.cvc.value = '';
-    showNotice(res.status === 'method' ? 'No se pudo completar la verificación con tu banco.' : res.message);
+    clearSensitive();
+    if (res.status === 'pending') {
+      payBtn.disabled = true;
+      showNotice(res.message || msg.unknown);
+      return null;
+    }
+    showNotice(res.status === 'method' ? msg.method : (res.message || msg.generic));
+    return null;
   }
 
-  function fail(e) {
-    setBusy(null);
-    showNotice(e && e.message ? e.message : 'No se pudo procesar el pago.');
+  function fail(err) {
+    clearSensitive();
+    // Nuestro servidor respondió con un mensaje claro (orden no válida, límite,
+    // otro pago en curso…): se muestra. Si no, el resultado puede ser desconocido.
+    if (err && err.known) {
+      setBusy(null);
+      showNotice(err.message || msg.generic);
+      return null;
+    }
+    return checkStatus();
   }
 
   payBtn.addEventListener('click', function () {
+    if (busy) return;
     var err = validate();
     showError(err);
     if (err) return;
@@ -226,7 +327,7 @@
     setBusy('paying');
 
     var exp = parseExp(inputs.exp.value);
-    post('/pay', {
+    request('POST', '/pay', {
       order_id: cfg.orderId,
       order_key: cfg.orderKey,
       card: {
@@ -244,9 +345,15 @@
         setBusy('authenticating');
         var unmount = mountMethodForm(res.methodForm);
         return waitMethodNotification()
-          .then(function () { return post('/continue', { order_id: cfg.orderId, order_key: cfg.orderKey }); })
+          .then(function () { return request('POST', '/continue', { order_id: cfg.orderId, order_key: cfg.orderKey }); })
           .finally(unmount);
       })
-      .then(finish, fail);
+      .then(finish)
+      .catch(fail)
+      .catch(function () {
+        // Último recurso: nunca dejar la página bloqueada sin explicación.
+        setBusy(null);
+        showNotice(msg.generic);
+      });
   });
 })();

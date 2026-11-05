@@ -2,7 +2,7 @@
 /**
  * Plugin Name: MFT AZUL API (pago con tarjeta + 3D Secure 2.0)
  * Description: Método de pago de WooCommerce que cobra con tarjeta dentro del sitio usando la "Integración vía API" de AZUL (JSON + autenticación mutua) con 3D Secure 2.0. Convive con la "Página de Pago AZUL": son métodos distintos.
- * Version: 0.4.0
+ * Version: 0.4.1
  * Requires Plugins: woocommerce
  * WC requires at least: 8.0
  *
@@ -58,7 +58,7 @@
 defined('ABSPATH') || exit;
 
 define('MFT_AZUL_API_ID', 'mft_azul_api');
-define('MFT_AZUL_API_VERSION', '0.4.0');
+define('MFT_AZUL_API_VERSION', '0.4.1');
 
 // Pedidos en tablas propias (HPOS): solo se usa la API de órdenes de WooCommerce.
 // El checkout por bloques no está soportado: el sitio usa [woocommerce_checkout].

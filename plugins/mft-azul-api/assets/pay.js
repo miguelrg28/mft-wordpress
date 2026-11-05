@@ -164,8 +164,7 @@
     if ($form.unblock) $form.unblock();
   }
 
-  function setBusy(stage) {
-    busy = !!stage;
+  function showOverlay(stage) {
     if (!overlay) {
       overlay = document.createElement('div');
       overlay.className = 'mft-azul__overlay';
@@ -175,20 +174,24 @@
       overlay.hidden = true;
       document.body.appendChild(overlay);
     }
-    overlay.hidden = !busy;
+    overlay.hidden = !stage;
+    if (stage) {
+      overlay.querySelector('.mft-azul__stage').textContent = stage === 'authenticating'
+        ? 'Verificando con tu banco...'
+        : stage === 'checking' ? (msg.checking || 'Confirmando tu pago...') : 'Procesando tu pago...';
+    }
+  }
+
+  function setBusy(stage) {
+    busy = !!stage;
+    showOverlay(stage);
     var btn = part('.mft-azul__pay');
     if (btn) btn.disabled = busy;
     FIELDS.forEach(function (k) {
       var el = input(k);
       if (el) el.disabled = busy;
     });
-    if (busy) {
-      overlay.querySelector('.mft-azul__stage').textContent = stage === 'authenticating'
-        ? 'Verificando con tu banco...'
-        : stage === 'checking' ? (msg.checking || 'Confirmando tu pago...') : 'Procesando tu pago...';
-    } else {
-      releaseCheckout();
-    }
+    if (!busy) releaseCheckout();
   }
 
   function go(url) {
@@ -470,7 +473,13 @@
       markInline();
       var err = validate();
       showError(err);
+      // El aviso sale ya, mientras WooCommerce crea la orden (en vez de su gris).
+      if (!err) showOverlay('paying');
       return !err;
+    });
+    // WooCommerce rechazó el pedido (falta un dato de facturación, etc.).
+    $(document.body).on('checkout_error', function () {
+      if (!busy) showOverlay(null);
     });
   }
   markInline();

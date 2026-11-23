@@ -5,7 +5,8 @@
  *
  * Es un mu-plugin para que nadie pueda desactivarlo desde el admin.
  *
- * - Equipo: cuentas con cualquier rol distinto de cliente o suscriptor. PCI no exige
+ * - Equipo: cuentas con cualquier rol que no sea de cliente (cliente, suscriptor,
+ *   participante MFT o contacto del CRM; ver MFT_SEC_CONSUMER_ROLES). PCI no exige
  *   estas reglas a las cuentas de clientes, así que el checkout no cambia.
  * - Bloqueo (todas las cuentas): 10 intentos fallidos seguidos bloquean la cuenta 30
  *   minutos; restablecer la contraseña la desbloquea. 30 fallos desde una misma IP
@@ -28,6 +29,8 @@ const MFT_SEC_LOCK_SECONDS = 1800;
 const MFT_SEC_IDLE_SECONDS = 900;
 const MFT_SEC_PASSWORD_MIN = 12;
 const MFT_SEC_PASSWORD_HISTORY = 4; // la actual y las 3 anteriores
+// Roles de clientes y participantes: no son equipo.
+const MFT_SEC_CONSUMER_ROLES = ['customer', 'subscriber', 'mft_participant', 'zerobs_customer'];
 
 // ---------------------------------------------------------------- utilidades
 
@@ -50,13 +53,13 @@ function mft_sec_ip(): string
     return $remote !== '' ? $remote : 'desconocida';
 }
 
-/** ¿Cuenta del equipo? (cualquier rol que no sea cliente o suscriptor). */
+/** ¿Cuenta del equipo? (algún rol que no sea de cliente). */
 function mft_sec_is_staff($user): bool
 {
     if (!$user instanceof WP_User || !$user->exists()) {
         return false;
     }
-    return (bool) array_diff((array) $user->roles, ['customer', 'subscriber']);
+    return (bool) array_diff((array) $user->roles, MFT_SEC_CONSUMER_ROLES);
 }
 
 function mft_sec_label($user): string
@@ -297,7 +300,7 @@ add_action('user_profile_update_errors', function ($errors, $update, $data) {
     if (!empty($data->role)) {
         $roles[] = $data->role;
     }
-    if (array_diff($roles, ['customer', 'subscriber'])) {
+    if (array_diff($roles, MFT_SEC_CONSUMER_ROLES)) {
         mft_sec_add_problems($errors, mft_sec_password_problems((string) $data->user_pass, $existing ?: null));
     }
 }, 10, 3);
